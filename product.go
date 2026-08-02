@@ -304,6 +304,31 @@ func productWithAlternates(products []jsonProduct, max int) *Product {
 	var candidates []candidate
 
 	for _, p := range products {
+		titleLower := strings.ToLower(p.Title)
+		isInsurance := false
+		for _, kw := range []string{
+			"package protection",
+			"shipping protection",
+			"shipping insurance",
+			"package insurance",
+			"free returns",
+			"return protection",
+			"return insurance",
+			"navidium",
+			"re:do",
+			"redo",
+			"route shipping",
+			"route package",
+		} {
+			if strings.Contains(titleLower, kw) {
+				isInsurance = true
+				break
+			}
+		}
+		if isInsurance {
+			continue
+		}
+
 		for _, v := range p.Variants {
 			price := parsePrice(v.Price)
 			if price <= 0 {

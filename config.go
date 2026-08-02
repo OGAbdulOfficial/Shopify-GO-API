@@ -15,6 +15,7 @@ var cfg = struct {
 	MaxWaitSeconds     float64
 	MaxPrice           float64
 	MaxPriceFallback   float64
+	MinPrice           float64
 	FastMode           bool
 	SummaryOnly        bool
 	HardcodedPhone     string
@@ -34,6 +35,7 @@ var cfg = struct {
 	MaxWaitSeconds:     2.0,
 	MaxPrice:           25.0,
 	MaxPriceFallback:   50.0,
+	MinPrice:           0.50,
 	FastMode:           true,
 	SummaryOnly:        true,
 	HardcodedPhone:     "2494851515",

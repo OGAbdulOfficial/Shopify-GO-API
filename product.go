@@ -309,6 +309,9 @@ func productWithAlternates(products []jsonProduct, max int) *Product {
 			if price <= 0 {
 				continue
 			}
+			if cfg.MinPrice > 0 && price < cfg.MinPrice {
+				continue
+			}
 			if cfg.MaxPrice > 0 && price > cfg.MaxPrice {
 				continue
 			}

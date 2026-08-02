@@ -40,5 +40,5 @@ var cfg = struct {
 	SiteRemoval:        true,
 	SingleProxyAttempt: true,
 	SingleSiteProbeSec:    12,
-	SingleSiteCheckoutSec: 18,
+	SingleSiteCheckoutSec: 35,
 }

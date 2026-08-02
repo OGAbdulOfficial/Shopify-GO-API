@@ -26,22 +26,46 @@ type ShopifyLegacyResponse struct {
 var realStdout = os.Stdout
 
 func handleShopifyLegacy(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed, use GET"})
+	var site, cc, proxyRaw string
+	var productCache map[string]CachedProduct
+
+	start := time.Now()
+
+	if r.Method == http.MethodPost {
+		type ShopifyLegacyPostRequest struct {
+			CC           string                  `json:"cc"`
+			Card         string                  `json:"card"` // fallback
+			Site         string                  `json:"site"`
+			Proxy        string                  `json:"proxy"`
+			ProductCache map[string]CachedProduct `json:"product_cache"`
+		}
+		var req ShopifyLegacyPostRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+			return
+		}
+		cc = strings.TrimSpace(req.CC)
+		if cc == "" {
+			cc = strings.TrimSpace(req.Card)
+		}
+		site = strings.TrimSpace(req.Site)
+		proxyRaw = strings.TrimSpace(req.Proxy)
+		productCache = req.ProductCache
+	} else if r.Method == http.MethodGet {
+		site = strings.TrimSpace(r.URL.Query().Get("site"))
+		cc = strings.TrimSpace(r.URL.Query().Get("cc"))
+		proxyRaw = strings.TrimSpace(r.URL.Query().Get("proxy"))
+	} else {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed, use GET or POST"})
 		return
 	}
 
-	start := time.Now()
-	site := strings.TrimSpace(r.URL.Query().Get("site"))
-	cc := strings.TrimSpace(r.URL.Query().Get("cc"))
-	proxyRaw := strings.TrimSpace(r.URL.Query().Get("proxy"))
-
 	if site == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "site query parameter is required"})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "site is required"})
 		return
 	}
 	if cc == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "cc query parameter is required (format: num|mm|yyyy|cvv)"})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "cc/card is required (format: num|mm|yyyy|cvv)"})
 		return
 	}
 
@@ -87,18 +111,20 @@ func handleShopifyLegacy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-
-
-	legacy := runShopifyQuiet(cc, site, proxyURL, proxies, proxyStatus)
+	legacy := runShopifyQuiet(cc, site, proxyURL, proxies, proxyStatus, productCache)
 	logShopifyResult(legacy)
 	writeJSON(w, http.StatusOK, legacy)
 }
 
-func runShopifyQuiet(cc, site, proxyURL string, proxies []string, proxyStatus string) ShopifyLegacyResponse {
+func runShopifyQuiet(cc, site, proxyURL string, proxies []string, proxyStatus string, productCache map[string]CachedProduct) ShopifyLegacyResponse {
 
 	addrFile := ""
 	if _, statErr := os.Stat("addresses.txt"); statErr == nil {
 		addrFile = "addresses.txt"
+	}
+
+	if productCache == nil {
+		productCache = make(map[string]CachedProduct)
 	}
 
 	result := processSingleMultiSite(
@@ -107,7 +133,7 @@ func runShopifyQuiet(cc, site, proxyURL string, proxies []string, proxyStatus st
 		proxyURL,
 		proxies,
 		addrFile,
-		make(map[string]CachedProduct),
+		productCache,
 		nil,
 	)
 	return mapSingleToLegacy(result, cc, proxyStatus)

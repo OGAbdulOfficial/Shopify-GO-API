@@ -163,9 +163,10 @@ func checkHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Prepare API response
 	status := "false"
-	if result.Status == "success" || result.Status == "3ds" {
+	switch result.Status {
+	case "success", "3ds":
 		status = "true"
-	} else if result.Status == "SiteError" {
+	case "SiteError":
 		status = "SiteError"
 	}
 

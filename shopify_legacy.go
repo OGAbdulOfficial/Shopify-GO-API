@@ -31,12 +31,13 @@ func handleShopifyLegacy(w http.ResponseWriter, r *http.Request) {
 
 	start := time.Now()
 
-	if r.Method == http.MethodPost {
+	switch r.Method {
+	case http.MethodPost:
 		type ShopifyLegacyPostRequest struct {
-			CC           string                  `json:"cc"`
-			Card         string                  `json:"card"` // fallback
-			Site         string                  `json:"site"`
-			Proxy        string                  `json:"proxy"`
+			CC           string                   `json:"cc"`
+			Card         string                   `json:"card"` // fallback
+			Site         string                   `json:"site"`
+			Proxy        string                   `json:"proxy"`
 			ProductCache map[string]CachedProduct `json:"product_cache"`
 		}
 		var req ShopifyLegacyPostRequest
@@ -51,11 +52,11 @@ func handleShopifyLegacy(w http.ResponseWriter, r *http.Request) {
 		site = strings.TrimSpace(req.Site)
 		proxyRaw = strings.TrimSpace(req.Proxy)
 		productCache = req.ProductCache
-	} else if r.Method == http.MethodGet {
+	case http.MethodGet:
 		site = strings.TrimSpace(r.URL.Query().Get("site"))
 		cc = strings.TrimSpace(r.URL.Query().Get("cc"))
 		proxyRaw = strings.TrimSpace(r.URL.Query().Get("proxy"))
-	} else {
+	default:
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed, use GET or POST"})
 		return
 	}

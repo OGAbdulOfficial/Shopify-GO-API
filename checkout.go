@@ -323,7 +323,32 @@ func (cs *CheckoutSession) populateShippingFromProposalBody(body string) {
 		}
 	}
 
-	totalAmount := extractCheckoutTotalStr(body)
+	totalAmount := ""
+	if sp != nil {
+		if ct := getMap(sp, "checkoutTotal"); ct != nil {
+			if val := getMap(ct, "value"); val != nil {
+				totalAmount = getString(val, "amount")
+				if cur := getString(val, "currencyCode"); cur != "" {
+					cs.CurrencyCode = cur
+				}
+			}
+		}
+		if totalAmount == "" {
+			if pay := getMap(sp, "payment"); pay != nil {
+				if ta := getMap(pay, "totalAmount"); ta != nil {
+					if val := getMap(ta, "value"); val != nil {
+						totalAmount = getString(val, "amount")
+						if cur := getString(val, "currencyCode"); cur != "" {
+							cs.CurrencyCode = cur
+						}
+					}
+				}
+			}
+		}
+	}
+	if totalAmount == "" {
+		totalAmount = extractCheckoutTotalStr(body)
+	}
 	if totalAmount == "" {
 		totalAmount = extractSellerTotalStr(body)
 	}

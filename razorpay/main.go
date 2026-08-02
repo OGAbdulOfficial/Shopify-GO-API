@@ -44,7 +44,7 @@ func main() {
 	fmt.Printf("    GET /razorpay?cc=...&site=...&proxy=...&amount=...\n")
 	fmt.Printf("======================================================================\n")
 
-	log.Fatal(http.ListenAndServe(":"+port, nil))
+	log.Fatal(http.ListenAndServe("0.0.0.0:"+port, nil))
 }
 
 func checkHandler(w http.ResponseWriter, r *http.Request) {

@@ -11,18 +11,6 @@ import (
 	"strings"
 )
 
-type RazorpaySession struct {
-	Client        *http.Client
-	ProxyURL      string
-	PageURL       string
-	KeyID         string
-	PageID        string
-	Currency      string
-	ItemID        string
-	ItemAmount    int // amount in paise
-	CustomAmount  int // amount in INR
-}
-
 type PaymentResult struct {
 	Status   string `json:"status"`
 	Response string `json:"response"`
@@ -67,6 +55,14 @@ func (s *RazorpaySession) ScrapePage() error {
 	}
 	s.KeyID = keyID
 
+	// Extract keyless_header from html page
+	keylessRe := regexp.MustCompile(`(?i)keyless_header\s*:\s*"([^"]+)"`)
+	if keylessMatch := keylessRe.FindStringSubmatch(html); len(keylessMatch) > 1 {
+		s.KeylessHeader = keylessMatch[1]
+	} else if keylessVal, ok := parsed["keyless_header"].(string); ok {
+		s.KeylessHeader = keylessVal
+	}
+
 	paymentLink, _ := parsed["payment_link"].(map[string]any)
 	if paymentLink == nil {
 		return fmt.Errorf("payment_link metadata not found")
@@ -84,48 +80,131 @@ func (s *RazorpaySession) ScrapePage() error {
 	}
 	s.Currency = currency
 
-	// Parse items to find a valid item ID and amount
-	items, _ := parsed["payment_page_items"].([]any)
+	// Extract minimum amount limit if defined on payment link (already in Paise)
+	var globalMin int
+	if val, ok := paymentLink["min_amount_value"].(float64); ok && val > 0 {
+		globalMin = int(val)
+	} else if val, ok := parsed["min_amount_value"].(float64); ok && val > 0 {
+		globalMin = int(val)
+	}
+
+	// Parse items to find all mandatory item IDs and their amounts
+	items, _ := paymentLink["payment_page_items"].([]any)
 	for _, it := range items {
 		itemMap, ok := it.(map[string]any)
 		if !ok {
 			continue
 		}
 		id, _ := itemMap["id"].(string)
+		
+		// Handle both bool and string versions of "mandatory"
+		var mandatory bool
+		if mandVal, ok := itemMap["mandatory"].(bool); ok {
+			mandatory = mandVal
+		} else if mandValStr, ok := itemMap["mandatory"].(string); ok {
+			mandatory = strings.EqualFold(mandValStr, "true") || mandValStr == "1"
+		}
+		
 		itemDetail, _ := itemMap["item"].(map[string]any)
-		if itemDetail == nil {
-			continue
+		var unitAmt float64
+		if itemDetail != nil {
+			if val, ok := itemDetail["amount"].(float64); ok && val > 0 {
+				unitAmt = val
+			} else if val, ok := itemDetail["unit_amount"].(float64); ok && val > 0 {
+				unitAmt = val
+			} else if valStr, ok := itemDetail["amount"].(string); ok {
+				unitAmt, _ = strconv.ParseFloat(valStr, 64)
+			} else if valStr, ok := itemDetail["unit_amount"].(string); ok {
+				unitAmt, _ = strconv.ParseFloat(valStr, 64)
+			}
 		}
 
-		s.ItemID = id
-		if amtVal, ok := itemDetail["amount"].(float64); ok && amtVal > 0 {
-			s.ItemAmount = int(amtVal)
+		// If unitAmt is still 0, check item min_amount (already in Paise)
+		if unitAmt == 0 {
+			if val, ok := itemDetail["min_amount"].(float64); ok && val > 0 {
+				unitAmt = val
+			} else if val, ok := itemMap["min_amount"].(float64); ok && val > 0 {
+				unitAmt = val
+			}
 		}
-		break
+
+		itemAmountInt := int(unitAmt)
+		if itemAmountInt < globalMin {
+			itemAmountInt = globalMin
+		}
+
+		// A mandatory page item OR the first item if no item selected yet
+		if mandatory || s.ItemID == "" {
+			if s.ItemID == "" {
+				s.ItemID = id
+				s.ItemAmount = itemAmountInt
+			}
+			if mandatory {
+				s.MandatoryItems = append(s.MandatoryItems, map[string]any{
+					"payment_page_item_id": id,
+					"amount":               itemAmountInt,
+				})
+			}
+		}
 	}
 
-	// Fallback to custom input amount if item amount is zero/empty
-	if s.ItemAmount == 0 {
+	// Fallback to custom input amount if total amount is zero/empty
+	if s.ItemAmount == 0 && len(s.MandatoryItems) == 0 {
 		if s.CustomAmount <= 0 {
-			s.CustomAmount = 10 // default 10 INR
+			s.CustomAmount = 100 // default 100 INR for open donation/custom amount pages
 		}
 		s.ItemAmount = s.CustomAmount * 100
+		if s.ItemAmount < globalMin {
+			s.ItemAmount = globalMin
+		}
+		s.MandatoryItems = append(s.MandatoryItems, map[string]any{
+			"payment_page_item_id": s.ItemID,
+			"amount":               s.ItemAmount,
+		})
+	} else if len(s.MandatoryItems) > 0 {
+		// Sum up total amount of all mandatory items
+		total := 0
+		for _, item := range s.MandatoryItems {
+			if amt, ok := item["amount"].(int); ok {
+				total += amt
+			}
+		}
+		s.ItemAmount = total
 	}
 
 	return nil
+}
+
+type RazorpaySession struct {
+	Client         *http.Client
+	ProxyURL       string
+	PageURL        string
+	KeyID          string
+	PageID         string
+	Currency       string
+	ItemID         string
+	ItemAmount     int // amount in paise
+	CustomAmount   int // amount in INR
+	MandatoryItems []map[string]any
+	KeylessHeader  string
 }
 
 // CreateOrder sends the order initialization payload to Razorpay and returns the order_id.
 func (s *RazorpaySession) CreateOrder(name, email, phone string) (string, error) {
 	url := fmt.Sprintf("https://api.razorpay.com/v1/payment_pages/%s/order", s.PageID)
 
-	payload := map[string]any{
-		"line_items": []map[string]any{
+	lineItems := s.MandatoryItems
+	if len(lineItems) == 0 {
+		lineItems = []map[string]any{
 			{
 				"payment_page_item_id": s.ItemID,
 				"amount":               s.ItemAmount,
 			},
-		},
+		}
+	}
+
+	payload := map[string]any{
+		"line_items": lineItems,
 		"notes": map[string]string{
 			"name":  name,
 			"email": email,
@@ -147,6 +226,9 @@ func (s *RazorpaySession) CreateOrder(name, email, phone string) (string, error)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Origin", "https://pages.razorpay.com")
 	req.Header.Set("Referer", s.PageURL)
+	if s.KeylessHeader != "" {
+		req.Header.Set("X-Razorpay-Keyless-Header", s.KeylessHeader)
+	}
 
 	resp, err := s.Client.Do(req)
 	if err != nil {
@@ -221,6 +303,9 @@ func (s *RazorpaySession) SubmitPayment(cardNo, expMonth, expYear, cvv, name, em
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Origin", "https://pages.razorpay.com")
 	req.Header.Set("Referer", s.PageURL)
+	if s.KeylessHeader != "" {
+		req.Header.Set("X-Razorpay-Keyless-Header", s.KeylessHeader)
+	}
 
 	resp, err := s.Client.Do(req)
 	if err != nil {
@@ -260,6 +345,13 @@ func (s *RazorpaySession) SubmitPayment(cardNo, expMonth, expYear, cvv, name, em
 			Response: "SUCCESS",
 			Message:  fmt.Sprintf("Status: %s", status),
 		}, nil
+	}
+
+	// Extract inner JSON if response contains JS var data wrapper
+	respStr := string(respBytes)
+	reData := regexp.MustCompile(`(?s)var\s+data\s*=\s*(\{.*?\});`)
+	if match := reData.FindStringSubmatch(respStr); len(match) > 1 {
+		respBytes = []byte(match[1])
 	}
 
 	// Parse decline reason on bad request / failure codes

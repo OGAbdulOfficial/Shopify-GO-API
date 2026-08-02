@@ -165,6 +165,8 @@ func checkHandler(w http.ResponseWriter, r *http.Request) {
 	status := "false"
 	if result.Status == "success" || result.Status == "3ds" {
 		status = "true"
+	} else if result.Status == "SiteError" {
+		status = "SiteError"
 	}
 
 	resp := APIResponse{

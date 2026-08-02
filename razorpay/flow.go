@@ -387,8 +387,21 @@ func (s *RazorpaySession) SubmitPayment(cardNo, expMonth, expYear, cvv, name, em
 			}
 
 			responseCode := "CARD_DECLINED"
+			statusText := "false"
+
 			reasonUpper := strings.ToUpper(reason + " " + desc + " " + code)
-			if strings.Contains(reasonUpper, "INSUFFICIENT") {
+
+			// Detect site / merchant account errors (e.g. temporary block placed on account)
+			if strings.Contains(reasonUpper, "TEMPORARY BLOCK") ||
+				strings.Contains(reasonUpper, "PUT ON HOLD") ||
+				strings.Contains(reasonUpper, "DEACTIVATED") ||
+				strings.Contains(reasonUpper, "ACCOUNT BLOCKED") ||
+				strings.Contains(reasonUpper, "SITE ADMIN") ||
+				strings.Contains(reasonUpper, "MANDATORY PAYMENT PAGE ITEM") ||
+				strings.Contains(reasonUpper, "SHOULD BE ORDERED") {
+				responseCode = "SITE_ERROR"
+				statusText = "SiteError"
+			} else if strings.Contains(reasonUpper, "INSUFFICIENT") {
 				responseCode = "INSUFFICIENT_FUNDS"
 			} else if strings.Contains(reasonUpper, "CVV") || strings.Contains(reasonUpper, "VERIFICATION") {
 				responseCode = "CVV_INVALID"
@@ -397,7 +410,7 @@ func (s *RazorpaySession) SubmitPayment(cardNo, expMonth, expYear, cvv, name, em
 			}
 
 			return &PaymentResult{
-				Status:   "fail",
+				Status:   statusText,
 				Response: responseCode,
 				Message:  desc,
 			}, nil

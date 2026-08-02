@@ -296,6 +296,7 @@ func runAPIServer() {
 	// Routes
 	mux.HandleFunc("/health", handleHealth)
 	mux.HandleFunc("/shopify", handleShopifyLegacy)
+	mux.HandleFunc("/razorpay", handleRazorpayAPI)
 	mux.HandleFunc("/api/check", handleCheckSingle)
 	mux.HandleFunc("/api/check/batch", handleCheckBatch)
 	mux.HandleFunc("/sites/working", handleGetWorkingSites)

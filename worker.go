@@ -279,6 +279,7 @@ func processCard(idx int, card Card, sites []string, proxies *ProxyRotator, addr
 				Addr:             randomAddress(addresses),
 				FP:               fp,
 				ShippingRequired: true,
+				ProductPrice:     product.PriceStr,
 			}
 
 			// Step 1: Add to cart

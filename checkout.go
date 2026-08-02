@@ -1191,12 +1191,24 @@ func (cs *CheckoutSession) Step3Proposal() error {
 	cs.populateShippingFromProposalBody(body3)
 	cs.logDeliveryState("final", body3, payload3)
 
-	// Single delivery poll if shipping data still missing
-	if cs.ShippingRequired && (cs.ShippingHandle == "" || len(cs.DeliveryExps) == 0) {
-		time.Sleep(checkoutDelay(80, 150))
-		body, err := cs.sendProposalAndUpdate(cs.QueueToken, email)
-		if err == nil && !cs.proposalTermsPending(body) {
-			cs.logDeliveryState("poll", body, "")
+	// Poll if shipping data is missing OR if total is missing/pending
+	needsPoll := (cs.ShippingRequired && (cs.ShippingHandle == "" || len(cs.DeliveryExps) == 0)) ||
+		cs.ActualTotal == "" ||
+		cs.proposalTermsPending(body3)
+
+	if needsPoll {
+		for pollAttempt := 1; pollAttempt <= 3; pollAttempt++ {
+			time.Sleep(checkoutDelay(100, 200))
+			body, err := cs.sendProposalAndUpdate(cs.QueueToken, email)
+			if err != nil {
+				break
+			}
+			if cs.ActualTotal != "" && !cs.proposalTermsPending(body) {
+				if cs.ShippingRequired && cs.ShippingHandle == "" {
+					continue
+				}
+				break
+			}
 		}
 	}
 
@@ -1641,7 +1653,7 @@ func (cs *CheckoutSession) proposalTermsPending(body string) bool {
 	}
 	result := navigateMap(resp, "data", "session", "negotiate", "result")
 	sp := getMap(result, "sellerProposal")
-	for _, key := range []string{"delivery", "deliveryExpectations"} {
+	for _, key := range []string{"delivery", "deliveryExpectations", "checkoutTotal"} {
 		if getString(getMap(sp, key), "__typename") == "PendingTerms" {
 			return true
 		}
@@ -1804,7 +1816,10 @@ func (cs *CheckoutSession) step4SubmitOnce() SubmitResult {
 
 	totalAmount := cs.ActualTotal
 	if totalAmount == "" {
-		totalAmount = "0.00"
+		totalAmount = cs.ProductPrice
+	}
+	if totalAmount == "" {
+		totalAmount = "1.00"
 	}
 
 	currency := cs.CurrencyCode

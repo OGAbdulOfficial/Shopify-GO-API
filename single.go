@@ -823,6 +823,7 @@ startPhase2:
 						Addr:               randomAddress(addresses),
 						FP:                 fp,
 						ShippingRequired:   true,
+						ProductPrice:       product.PriceStr,
 					}
 
 					makeResp := func(status, code string) SingleResponse {

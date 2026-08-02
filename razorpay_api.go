@@ -14,7 +14,6 @@ import (
 	"time"
 )
 
-// RazorpayAPIResponse represents the JSON output for GET /razorpay
 type RazorpayAPIResponse struct {
 	CC       string `json:"cc"`
 	Gateway  string `json:"Gateway"`
@@ -25,13 +24,6 @@ type RazorpayAPIResponse struct {
 	Message  string `json:"Message"`
 	Time     string `json:"Time"`
 	Proxy    string `json:"Proxy"`
-}
-
-func getProxyLabel(proxy string) string {
-	if proxy != "" {
-		return "Live"
-	}
-	return "None"
 }
 
 type RazorpayPaymentResult struct {
@@ -46,8 +38,10 @@ type RazorpaySession struct {
 	KeylessHeader string
 	KeyID         string
 	PaymentLinkID string
-	ItemAmount    int // amount in paise
+	ItemID        string
+	ItemAmount    int // native paise
 	Currency      string
+	IsMinAmount   bool
 }
 
 func buildRazorpayHTTPClient(proxyURL string) (*http.Client, error) {
@@ -66,6 +60,13 @@ func buildRazorpayHTTPClient(proxyURL string) (*http.Client, error) {
 		Transport: transport,
 		Timeout:   35 * time.Second,
 	}, nil
+}
+
+func getProxyLabel(proxy string) string {
+	if proxy != "" {
+		return "Live"
+	}
+	return "None"
 }
 
 func NewRazorpaySession(client *http.Client, pageURL string) *RazorpaySession {
@@ -100,13 +101,11 @@ func (s *RazorpaySession) ScrapePage() error {
 	}
 	html := string(bodyBytes)
 
-	// Extract X-Razorpay-Keyless-Header
 	reHeader := regexp.MustCompile(`(?i)keyless_header\s*:\s*"([^"]+)"`)
 	if match := reHeader.FindStringSubmatch(html); len(match) > 1 {
 		s.KeylessHeader = match[1]
 	}
 
-	// Extract var data JSON payload
 	reData := regexp.MustCompile(`(?s)var\s+data\s*=\s*(\{.*?\});`)
 	matchData := reData.FindStringSubmatch(html)
 	if len(matchData) < 2 {
@@ -136,6 +135,8 @@ func (s *RazorpaySession) ScrapePage() error {
 	}
 
 	firstItem, _ := items[0].(map[string]any)
+	s.ItemID, _ = firstItem["id"].(string)
+
 	amountVal := 0
 	if amt, ok := firstItem["amount"].(float64); ok && amt > 0 {
 		amountVal = int(amt)
@@ -143,12 +144,14 @@ func (s *RazorpaySession) ScrapePage() error {
 		amountVal = int(uAmt)
 	} else if minAmt, ok := firstItem["min_amount"].(float64); ok && minAmt > 0 {
 		amountVal = int(minAmt)
+		s.IsMinAmount = true
 	} else if minAmtVal, ok := firstItem["min_amount_value"].(float64); ok && minAmtVal > 0 {
 		amountVal = int(minAmtVal)
+		s.IsMinAmount = true
 	}
 
 	if amountVal <= 0 {
-		amountVal = 100 // default 1 INR (100 paise)
+		amountVal = 100
 	}
 	s.ItemAmount = amountVal
 
@@ -159,14 +162,30 @@ func (s *RazorpaySession) ScrapePage() error {
 	return nil
 }
 
-func (s *RazorpaySession) CreateOrder(customAmountINR int) (string, error) {
+func (s *RazorpaySession) CreateOrder(customAmountINR int, name, email, phone string) (string, error) {
+	targetURL := fmt.Sprintf("https://api.razorpay.com/v1/payment_pages/%s/order", s.PaymentLinkID)
+
 	if customAmountINR > 0 {
 		s.ItemAmount = customAmountINR * 100
 	}
 
-	targetURL := fmt.Sprintf("https://api.razorpay.com/v1/payment_pages/%s/order", s.PaymentLinkID)
+	var lineItems []map[string]any
+	if s.ItemID != "" {
+		lineItems = []map[string]any{
+			{
+				"payment_page_item_id": s.ItemID,
+				"amount":               s.ItemAmount,
+			},
+		}
+	}
+
 	payload := map[string]any{
-		"amount": s.ItemAmount,
+		"line_items": lineItems,
+		"notes": map[string]string{
+			"name":  name,
+			"email": email,
+			"phone": phone,
+		},
 	}
 
 	bodyBytes, err := json.Marshal(payload)
@@ -189,7 +208,7 @@ func (s *RazorpaySession) CreateOrder(customAmountINR int) (string, error) {
 
 	resp, err := s.Client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("order creation request failed: %w", err)
+		return "", fmt.Errorf("order initialization failed: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -198,18 +217,23 @@ func (s *RazorpaySession) CreateOrder(customAmountINR int) (string, error) {
 		return "", err
 	}
 
-	var resData map[string]any
-	if err := json.Unmarshal(respBytes, &resData); err != nil {
-		return "", fmt.Errorf("invalid json in order creation response")
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		return "", fmt.Errorf("order creation HTTP %d: %s", resp.StatusCode, string(respBytes))
 	}
 
-	orderID, _ := resData["id"].(string)
+	var parsed map[string]any
+	if err := json.Unmarshal(respBytes, &parsed); err != nil {
+		return "", err
+	}
+
+	orderData, _ := parsed["order"].(map[string]any)
+	if orderData == nil {
+		return "", fmt.Errorf("order object missing in response: %s", string(respBytes))
+	}
+
+	orderID, _ := orderData["id"].(string)
 	if orderID == "" {
-		if errData, ok := resData["error"].(map[string]any); ok {
-			desc, _ := errData["description"].(string)
-			return "", fmt.Errorf("%s", desc)
-		}
-		return "", fmt.Errorf("order creation failed: %s", string(respBytes))
+		return "", fmt.Errorf("order_id missing in response")
 	}
 
 	return orderID, nil
@@ -272,7 +296,6 @@ func (s *RazorpaySession) SubmitPayment(cardNo, expMonth, expYear, cvv, name, em
 	respStr := string(respBytes)
 	reData := regexp.MustCompile(`(?s)var\s+data\s*=\s*(\{.*?\});`)
 
-	// Check if response is an intermediate fee breakup HTML form
 	if strings.Contains(respStr, "payments/create/checkout") {
 		formActionRe := regexp.MustCompile(`(?i)<form[^>]+action=['"]([^'"]+)['"]`)
 		actionMatch := formActionRe.FindStringSubmatch(respStr)
@@ -457,7 +480,7 @@ func handleRazorpayAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	orderID, err := session.CreateOrder(customAmount)
+	orderID, err := session.CreateOrder(customAmount, "Jane Doe", "janedoe@example.com", "+919876543210")
 	if err != nil {
 		resp := RazorpayAPIResponse{
 			CC:       ccLine,

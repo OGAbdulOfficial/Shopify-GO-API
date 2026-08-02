@@ -127,7 +127,7 @@ func fetchStorefrontAccessToken(client *http.Client, shopURL string, fp Fingerpr
 }
 
 const storefrontProductsQuery = `query StorefrontProducts($first: Int!) {
-  products(first: $first) {
+  products(first: $first, sortKey: PRICE) {
     edges {
       node {
         title
@@ -342,10 +342,10 @@ func productWithAlternates(products []jsonProduct, max int) *Product {
 	}
 
 	sort.Slice(candidates, func(i, j int) bool {
-		if candidates[i].requiresShipping != candidates[j].requiresShipping {
-			return candidates[i].requiresShipping
+		if candidates[i].price != candidates[j].price {
+			return candidates[i].price < candidates[j].price
 		}
-		return candidates[i].price < candidates[j].price
+		return candidates[i].requiresShipping
 	})
 
 	if max <= 0 {

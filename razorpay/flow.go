@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -265,7 +266,7 @@ func (s *RazorpaySession) CreateOrder(name, email, phone string) (string, error)
 
 // SubmitPayment authorizes the card using Razorpay payments API.
 func (s *RazorpaySession) SubmitPayment(cardNo, expMonth, expYear, cvv, name, email, phone, orderID string) (*PaymentResult, error) {
-	url := "https://api.razorpay.com/v1/payments"
+	targetURL := "https://api.razorpay.com/v1/payments"
 
 	payload := map[string]any{
 		"key_id":   s.KeyID,
@@ -294,7 +295,7 @@ func (s *RazorpaySession) SubmitPayment(cardNo, expMonth, expYear, cvv, name, em
 		return nil, err
 	}
 
-	req, err := http.NewRequest("POST", url, bytes.NewReader(bodyBytes))
+	req, err := http.NewRequest("POST", targetURL, bytes.NewReader(bodyBytes))
 	if err != nil {
 		return nil, err
 	}
@@ -318,54 +319,75 @@ func (s *RazorpaySession) SubmitPayment(cardNo, expMonth, expYear, cvv, name, em
 		return nil, err
 	}
 
-	if resp.StatusCode == http.StatusOK {
-		var parsed map[string]any
-		_ = json.Unmarshal(respBytes, &parsed)
-
-		// Check for 3DS / redirects
-		if parsed["callback_url"] != nil || parsed["next"] != nil {
-			return &PaymentResult{
-				Status:   "3ds",
-				Response: "3DS_REQUIRED",
-				Message:  "Card verification (OTP/3DS) is required by the bank",
-			}, nil
-		}
-
-		status, _ := parsed["status"].(string)
-		if status == "captured" || status == "authorized" {
-			return &PaymentResult{
-				Status:   "success",
-				Response: "SUCCESS",
-				Message:  "Payment authorized successfully",
-			}, nil
-		}
-
-		return &PaymentResult{
-			Status:   "success",
-			Response: "SUCCESS",
-			Message:  fmt.Sprintf("Status: %s", status),
-		}, nil
-	}
-
-	// Extract inner JSON if response contains JS var data wrapper
 	respStr := string(respBytes)
 	reData := regexp.MustCompile(`(?s)var\s+data\s*=\s*(\{.*?\});`)
-	if match := reData.FindStringSubmatch(respStr); len(match) > 1 {
-		respBytes = []byte(match[1])
+
+	// Check if response is an intermediate fee breakup HTML form
+	if strings.Contains(respStr, "payments/create/checkout") {
+		formActionRe := regexp.MustCompile(`(?i)<form[^>]+action=['"]([^'"]+)['"]`)
+		actionMatch := formActionRe.FindStringSubmatch(respStr)
+		if len(actionMatch) > 1 {
+			actionURL := actionMatch[1]
+
+			// Extract all hidden form fields
+			inputRe := regexp.MustCompile(`(?i)<input[^>]+type=['"]hidden['"][^>]+name=['"]([^'"]+)['"][^>]+value=['"]([^'"]*)['"]`)
+			inputMatches := inputRe.FindAllStringSubmatch(respStr, -1)
+
+			formData := url.Values{}
+			for _, m := range inputMatches {
+				if len(m) > 2 {
+					formData.Set(m[1], m[2])
+				}
+			}
+
+			// Send 2nd POST request to checkout action URL
+			req2, err := http.NewRequest("POST", actionURL, strings.NewReader(formData.Encode()))
+			if err == nil {
+				req2.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+				req2.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+				req2.Header.Set("Origin", "https://pages.razorpay.com")
+				req2.Header.Set("Referer", s.PageURL)
+				if s.KeylessHeader != "" {
+					req2.Header.Set("X-Razorpay-Keyless-Header", s.KeylessHeader)
+				}
+
+				resp2, err2 := s.Client.Do(req2)
+				if err2 == nil {
+					defer resp2.Body.Close()
+					resp2Bytes, _ := io.ReadAll(resp2.Body)
+					respBytes = resp2Bytes
+					respStr = string(resp2Bytes)
+				}
+			}
+		}
 	}
 
-	// Parse decline reason on bad request / failure codes
-	var errResp map[string]any
-	if jsonErr := json.Unmarshal(respBytes, &errResp); jsonErr == nil {
-		if errData, ok := errResp["error"].(map[string]any); ok {
+	// Try parsing JSON (from raw body or var data wrapper)
+	var parsed map[string]any
+	if match := reData.FindStringSubmatch(respStr); len(match) > 1 {
+		_ = json.Unmarshal([]byte(match[1]), &parsed)
+	} else {
+		_ = json.Unmarshal(respBytes, &parsed)
+	}
+
+	if parsed != nil {
+		// 1. Check for error payload regardless of HTTP status code
+		if errData, ok := parsed["error"].(map[string]any); ok {
 			reason, _ := errData["reason"].(string)
 			desc, _ := errData["description"].(string)
+			code, _ := errData["code"].(string)
+			if desc == "" {
+				desc = reason
+			}
+			if desc == "" {
+				desc = code
+			}
 			if desc == "" {
 				desc = "Declined by gateway"
 			}
 
 			responseCode := "CARD_DECLINED"
-			reasonUpper := strings.ToUpper(reason)
+			reasonUpper := strings.ToUpper(reason + " " + desc + " " + code)
 			if strings.Contains(reasonUpper, "INSUFFICIENT") {
 				responseCode = "INSUFFICIENT_FUNDS"
 			} else if strings.Contains(reasonUpper, "CVV") || strings.Contains(reasonUpper, "VERIFICATION") {
@@ -378,6 +400,33 @@ func (s *RazorpaySession) SubmitPayment(cardNo, expMonth, expYear, cvv, name, em
 				Status:   "fail",
 				Response: responseCode,
 				Message:  desc,
+			}, nil
+		}
+
+		// 2. Check for 3DS / Redirects / OTP
+		if parsed["callback_url"] != nil || parsed["next"] != nil || parsed["action"] != nil {
+			return &PaymentResult{
+				Status:   "3ds",
+				Response: "3DS_REQUIRED",
+				Message:  "Card verification (OTP/3DS) is required by the bank",
+			}, nil
+		}
+
+		// 3. Check for successful authorization/capture
+		status, _ := parsed["status"].(string)
+		if status == "captured" || status == "authorized" {
+			return &PaymentResult{
+				Status:   "success",
+				Response: "SUCCESS",
+				Message:  "Payment authorized successfully",
+			}, nil
+		}
+
+		if status != "" {
+			return &PaymentResult{
+				Status:   "fail",
+				Response: "CARD_DECLINED",
+				Message:  fmt.Sprintf("Payment status: %s", status),
 			}, nil
 		}
 	}

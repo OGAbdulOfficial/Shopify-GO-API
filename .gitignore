@@ -1,0 +1,4 @@
+gocheck
+gocheck_api
+*.exe
+*.bak

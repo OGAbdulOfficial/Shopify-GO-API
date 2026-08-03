@@ -7,8 +7,17 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 )
+
+// defaultSites is the shared pool of Razorpay Pages used when no site is specified.
+var defaultSites = []string{
+	"https://pages.razorpay.com/pl_HB3M7WgxCaYkO2/view",
+	"https://pages.razorpay.com/satgurucharity",
+	"https://pages.razorpay.com/agape",
+	"https://pages.razorpay.com/epdonation",
+}
 
 type APIResponse struct {
 	CC       string `json:"cc"`
@@ -33,15 +42,19 @@ func main() {
 		_, _ = w.Write([]byte(`{"status":"ok","service":"razorpay-pages-checker"}`))
 	})
 
-	http.HandleFunc("/shopify", checkHandler) // mapped for backwards compatibility
+	http.HandleFunc("/shopify", checkHandler)   // backwards compat
 	http.HandleFunc("/razorpay", checkHandler)
+	http.HandleFunc("/sites", sitesListHandler)
+	http.HandleFunc("/sites/test", sitesTestHandler)
 
 	fmt.Printf("======================================================================\n")
 	fmt.Printf("  Razorpay Pages API Server\n")
 	fmt.Printf("======================================================================\n")
 	fmt.Printf("  Listening on http://0.0.0.0:%s\n\n", port)
-	fmt.Printf("  Endpoint:\n")
+	fmt.Printf("  Endpoints:\n")
 	fmt.Printf("    GET /razorpay?cc=...&site=...&proxy=...&amount=...\n")
+	fmt.Printf("    GET /sites          - List all default sites\n")
+	fmt.Printf("    GET /sites/test     - Live-test all default sites (no CC needed)\n")
 	fmt.Printf("======================================================================\n")
 
 	log.Fatal(http.ListenAndServe("0.0.0.0:"+port, nil))
@@ -56,14 +69,7 @@ func checkHandler(w http.ResponseWriter, r *http.Request) {
 	proxyURL := r.URL.Query().Get("proxy")
 	amountStr := r.URL.Query().Get("amount")
 
-	defaultSites := []string{
-		"https://pages.razorpay.com/satgurucharity",
-		"https://pages.razorpay.com/agape",
-		"https://pages.razorpay.com/epdonation",
-		"https://pages.razorpay.com/saveourearth",
-		"https://pages.razorpay.com/exceldigital",
-		"https://pages.razorpay.com/pl_HB3M7WgxCaYkO2/view",
-	}
+	// use package-level defaultSites pool
 
 	if ccLine == "" {
 		w.WriteHeader(http.StatusBadRequest)
@@ -195,4 +201,107 @@ func getProxyLabel(proxyURL string) string {
 		return "Direct"
 	}
 	return "Live"
+}
+
+// ─── /sites ──────────────────────────────────────────────────────────────────
+
+// sitesListHandler returns the list of all default Razorpay pages.
+func sitesListHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	type SiteList struct {
+		Total int      `json:"total"`
+		Sites []string `json:"sites"`
+	}
+	resp := SiteList{Total: len(defaultSites), Sites: defaultSites}
+	jsonResp, _ := json.Marshal(resp)
+	_, _ = w.Write(jsonResp)
+}
+
+// ─── /sites/test ─────────────────────────────────────────────────────────────
+
+type SiteTestResult struct {
+	Site    string `json:"site"`
+	Status  string `json:"status"` // "live" | "dead"
+	Message string `json:"message,omitempty"`
+	Time    string `json:"time"`
+}
+
+type SitesTestResponse struct {
+	Total    int              `json:"total"`
+	Live     int              `json:"live"`
+	Dead     int              `json:"dead"`
+	Elapsed  string           `json:"elapsed"`
+	Results  []SiteTestResult `json:"results"`
+}
+
+// sitesTestHandler tests every default Razorpay page concurrently by scraping it
+// (no CC required). Returns which are live vs dead.
+func sitesTestHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	proxyURL := r.URL.Query().Get("proxy")
+	overall := time.Now()
+
+	results := make([]SiteTestResult, len(defaultSites))
+	var wg sync.WaitGroup
+
+	for i, site := range defaultSites {
+		wg.Add(1)
+		go func(idx int, pageURL string) {
+			defer wg.Done()
+			start := time.Now()
+
+			client, err := newClient(proxyURL, 12*time.Second)
+			if err != nil {
+				results[idx] = SiteTestResult{
+					Site:    pageURL,
+					Status:  "dead",
+					Message: fmt.Sprintf("proxy error: %v", err),
+					Time:    fmt.Sprintf("%.2fs", time.Since(start).Seconds()),
+				}
+				return
+			}
+
+			session := &RazorpaySession{
+				Client:  client,
+				PageURL: pageURL,
+			}
+			if err := session.ScrapePage(); err != nil {
+				results[idx] = SiteTestResult{
+					Site:    pageURL,
+					Status:  "dead",
+					Message: err.Error(),
+					Time:    fmt.Sprintf("%.2fs", time.Since(start).Seconds()),
+				}
+				return
+			}
+
+			results[idx] = SiteTestResult{
+				Site:   pageURL,
+				Status: "live",
+				Time:   fmt.Sprintf("%.2fs", time.Since(start).Seconds()),
+			}
+		}(i, site)
+	}
+
+	wg.Wait()
+
+	live, dead := 0, 0
+	for _, res := range results {
+		if res.Status == "live" {
+			live++
+		} else {
+			dead++
+		}
+	}
+
+	finalResp := SitesTestResponse{
+		Total:   len(defaultSites),
+		Live:    live,
+		Dead:    dead,
+		Elapsed: fmt.Sprintf("%.2fs", time.Since(overall).Seconds()),
+		Results: results,
+	}
+	jsonResp, _ := json.Marshal(finalResp)
+	_, _ = w.Write(jsonResp)
 }

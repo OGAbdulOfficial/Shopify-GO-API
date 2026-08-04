@@ -417,11 +417,11 @@ func (s *RazorpaySession) SubmitPayment(cardNo, expMonth, expYear, cvv, name, em
 		}
 
 		// 2. Check for 3DS / Redirects / OTP in JSON
-		if parsed["callback_url"] != nil || parsed["next"] != nil || parsed["action"] != nil || parsed["razorpay_payment_id"] != nil {
+		if parsed["callback_url"] != nil || parsed["next"] != nil || parsed["action"] != nil {
 			return &PaymentResult{
 				Status:   "3ds",
-				Response: "CHARGED",
-				Message:  "Payment Charged / 3DS Verification Required (OTP)",
+				Response: "3DS_REQUIRED",
+				Message:  "Card verification (OTP/3DS) is required by the bank",
 			}, nil
 		}
 
@@ -453,8 +453,8 @@ func (s *RazorpaySession) SubmitPayment(cardNo, expMonth, expYear, cvv, name, em
 		strings.Contains(respStr, "RazorpayShield") {
 		return &PaymentResult{
 			Status:   "3ds",
-			Response: "CHARGED",
-			Message:  "Payment Successful - 3DS OTP Challenge Triggered (Charged)",
+			Response: "3DS_REQUIRED",
+			Message:  "Card verification (OTP/3DS) is required by the bank",
 		}, nil
 	}
 

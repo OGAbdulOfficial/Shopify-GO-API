@@ -14,9 +14,12 @@ import (
 // defaultSites is the shared pool of Razorpay Pages used when no site is specified.
 var defaultSites = []string{
 	"https://pages.razorpay.com/pl_HB3M7WgxCaYkO2/view",
+	"https://pages.razorpay.com/childdonation",
 	"https://pages.razorpay.com/satgurucharity",
 	"https://pages.razorpay.com/agape",
 	"https://pages.razorpay.com/epdonation",
+	"https://pages.razorpay.com/amazon",
+	"https://pages.razorpay.com/checker",
 }
 
 type APIResponse struct {

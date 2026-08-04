@@ -34,6 +34,32 @@ type APIResponse struct {
 	Proxy    string `json:"Proxy"`
 }
 
+type RequestLog struct {
+	Timestamp string `json:"timestamp"`
+	CC        string `json:"cc"`
+	Site      string `json:"site"`
+	Response  string `json:"response"`
+	Status    string `json:"status"`
+	Message   string `json:"message"`
+	Time      string `json:"time"`
+	Proxy     string `json:"proxy"`
+}
+
+var (
+	recentLogs   []RequestLog
+	logsMutex    sync.Mutex
+	maxLogBuffer = 100
+)
+
+func addLog(logEntry RequestLog) {
+	logsMutex.Lock()
+	defer logsMutex.Unlock()
+	recentLogs = append([]RequestLog{logEntry}, recentLogs...)
+	if len(recentLogs) > maxLogBuffer {
+		recentLogs = recentLogs[:maxLogBuffer]
+	}
+}
+
 func main() {
 	port := os.Getenv("RAZORPAY_PORT")
 	if port == "" {
@@ -49,6 +75,7 @@ func main() {
 	http.HandleFunc("/razorpay", checkHandler)
 	http.HandleFunc("/sites", sitesListHandler)
 	http.HandleFunc("/sites/test", sitesTestHandler)
+	http.HandleFunc("/logs", logsHandler)
 
 	fmt.Printf("======================================================================\n")
 	fmt.Printf("  Razorpay Pages API Server\n")
@@ -58,6 +85,7 @@ func main() {
 	fmt.Printf("    GET /razorpay?cc=...&site=...&proxy=...&amount=...\n")
 	fmt.Printf("    GET /sites          - List all default sites\n")
 	fmt.Printf("    GET /sites/test     - Live-test all default sites (no CC needed)\n")
+	fmt.Printf("    GET /logs           - View recent Razorpay API request logs\n")
 	fmt.Printf("======================================================================\n")
 
 	log.Fatal(http.ListenAndServe("0.0.0.0:"+port, nil))
@@ -180,6 +208,17 @@ func checkHandler(w http.ResponseWriter, r *http.Request) {
 			Proxy:    getProxyLabel(proxyURL),
 		}
 
+		addLog(RequestLog{
+			Timestamp: time.Now().Format("2006-01-02 15:04:05"),
+			CC:        ccLine,
+			Site:      currentSite,
+			Response:  result.Response,
+			Status:    status,
+			Message:   result.Message,
+			Time:      finalResp.Time,
+			Proxy:     finalResp.Proxy,
+		})
+
 		jsonResp, _ := json.Marshal(finalResp)
 		_, _ = w.Write(jsonResp)
 		return
@@ -195,6 +234,18 @@ func checkHandler(w http.ResponseWriter, r *http.Request) {
 		Time:     fmt.Sprintf("%.2fs", time.Since(startTime).Seconds()),
 		Proxy:    getProxyLabel(proxyURL),
 	}
+
+	addLog(RequestLog{
+		Timestamp: time.Now().Format("2006-01-02 15:04:05"),
+		CC:        ccLine,
+		Site:      "ALL_SITES",
+		Response:  "SITE_ERROR",
+		Status:    "SiteError",
+		Message:   lastErr,
+		Time:      finalResp.Time,
+		Proxy:     finalResp.Proxy,
+	})
+
 	jsonResp, _ := json.Marshal(finalResp)
 	_, _ = w.Write(jsonResp)
 }
@@ -306,5 +357,24 @@ func sitesTestHandler(w http.ResponseWriter, r *http.Request) {
 		Results: results,
 	}
 	jsonResp, _ := json.Marshal(finalResp)
+	_, _ = w.Write(jsonResp)
+}
+
+// ─── /logs ───────────────────────────────────────────────────────────────────
+
+func logsHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	logsMutex.Lock()
+	defer logsMutex.Unlock()
+
+	type LogsResponse struct {
+		Total int          `json:"total"`
+		Logs  []RequestLog `json:"logs"`
+	}
+	resp := LogsResponse{
+		Total: len(recentLogs),
+		Logs:  recentLogs,
+	}
+	jsonResp, _ := json.Marshal(resp)
 	_, _ = w.Write(jsonResp)
 }

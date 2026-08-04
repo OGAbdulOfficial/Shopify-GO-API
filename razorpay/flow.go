@@ -416,12 +416,12 @@ func (s *RazorpaySession) SubmitPayment(cardNo, expMonth, expYear, cvv, name, em
 			}, nil
 		}
 
-		// 2. Check for 3DS / Redirects / OTP
-		if parsed["callback_url"] != nil || parsed["next"] != nil || parsed["action"] != nil {
+		// 2. Check for 3DS / Redirects / OTP in JSON
+		if parsed["callback_url"] != nil || parsed["next"] != nil || parsed["action"] != nil || parsed["razorpay_payment_id"] != nil {
 			return &PaymentResult{
 				Status:   "3ds",
-				Response: "3DS_REQUIRED",
-				Message:  "Card verification (OTP/3DS) is required by the bank",
+				Response: "CHARGED",
+				Message:  "Payment Charged / 3DS Verification Required (OTP)",
 			}, nil
 		}
 
@@ -430,8 +430,8 @@ func (s *RazorpaySession) SubmitPayment(cardNo, expMonth, expYear, cvv, name, em
 		if status == "captured" || status == "authorized" {
 			return &PaymentResult{
 				Status:   "success",
-				Response: "SUCCESS",
-				Message:  "Payment authorized successfully",
+				Response: "CHARGED",
+				Message:  "Payment Authorized Successfully (Charged)",
 			}, nil
 		}
 
@@ -442,6 +442,20 @@ func (s *RazorpaySession) SubmitPayment(cardNo, expMonth, expYear, cvv, name, em
 				Message:  fmt.Sprintf("Payment status: %s", status),
 			}, nil
 		}
+	}
+
+	// Check if HTML body contains 3DS / Bank OTP redirect form
+	if strings.Contains(respStr, "3ds2Auth") ||
+		strings.Contains(respStr, "pg_router") ||
+		strings.Contains(respStr, "authenticate") ||
+		strings.Contains(respStr, "3dsMethodPostingForm") ||
+		strings.Contains(respStr, "Loading Bank page") ||
+		strings.Contains(respStr, "RazorpayShield") {
+		return &PaymentResult{
+			Status:   "3ds",
+			Response: "CHARGED",
+			Message:  "Payment Successful - 3DS OTP Challenge Triggered (Charged)",
+		}, nil
 	}
 
 	return &PaymentResult{

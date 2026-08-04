@@ -336,6 +336,7 @@ func performStripe3DSLookup(req VBVRequest, cardNum, expMonth, expYear, cvv stri
 }
 
 func build3DSResult(cardNum, expMonth, expYear, cvv, pmStr string, threeDSSupported bool, binInfo BINInfo, startTime time.Time, proxy string) VBVResponse {
+	_ = pmStr
 	isVBV := threeDSSupported
 	status := "NON_VBV"
 	statusText := "Non-VBV (2D Direct Pass)"

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -167,7 +168,7 @@ func checkHandler(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		if result.Status == "SiteError" && len(sitesToTry) > 1 {
+		if (result.Status == "SiteError" || strings.Contains(strings.ToLower(result.Message), "international cards are not supported")) && len(sitesToTry) > 1 {
 			lastErr = fmt.Sprintf("Site error on %s: %s", currentSite, result.Message)
 			continue
 		}

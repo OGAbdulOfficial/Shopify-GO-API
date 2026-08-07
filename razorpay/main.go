@@ -13,9 +13,9 @@ import (
 
 // defaultSites contains Razorpay pages that support International cards.
 var defaultSites = []string{
-	"https://pages.razorpay.com/satgurucharity",
-	"https://pages.razorpay.com/pl_HB3M7WgxCaYkO2/view",
 	"https://pages.razorpay.com/agape",
+	"https://pages.razorpay.com/pl_HB3M7WgxCaYkO2/view",
+	"https://pages.razorpay.com/satgurucharity",
 }
 
 type APIResponse struct {
@@ -97,8 +97,8 @@ func checkHandler(w http.ResponseWriter, r *http.Request) {
 		sitesToTry = []string{siteURL}
 	}
 
-	// Default custom amount (INR)
-	customAmount := 10
+	// Default custom amount (INR) - ₹1 (Lowest possible Razorpay amount)
+	customAmount := 1
 	if amountStr != "" {
 		if val, err := strconv.Atoi(amountStr); err == nil && val > 0 {
 			customAmount = val

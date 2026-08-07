@@ -14,6 +14,8 @@ import (
 // defaultSites contains Razorpay pages that support International cards.
 var defaultSites = []string{
 	"https://pages.razorpay.com/satgurucharity",
+	"https://pages.razorpay.com/pl_HB3M7WgxCaYkO2/view",
+	"https://pages.razorpay.com/agape",
 }
 
 type APIResponse struct {

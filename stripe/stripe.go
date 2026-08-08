@@ -64,20 +64,22 @@ func parseCard(cc string) (num, mm, yy, cvv string, ok bool) {
 	return
 }
 
-// ─── HTTP Client with proxy ───────────────────────────────────────────────────
-
 func buildClient(proxyURL string, timeout time.Duration) *http.Client {
 	jar, _ := cookiejar.New(nil)
-	transport := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: false},
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
 	if proxyURL != "" {
 		proxyURL = normaliseProxy(proxyURL)
 		if parsed, err := url.Parse(proxyURL); err == nil {
-			transport.Proxy = http.ProxyURL(parsed)
+			tr.Proxy = http.ProxyURL(parsed)
 		}
 	}
-	return &http.Client{Transport: transport, Timeout: timeout, Jar: jar}
+	return &http.Client{
+		Timeout:   timeout,
+		Transport: tr,
+		Jar:       jar,
+	}
 }
 
 // normaliseProxy converts host:port:user:pass or bare host:port into http://... form
@@ -361,6 +363,11 @@ func doGET(client *http.Client, rawURL string, headers map[string]string) ([]byt
 		return nil, err
 	}
 	req.Header.Set("User-Agent", ua)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("Sec-Ch-Ua", `"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"`)
+	req.Header.Set("Sec-Ch-Ua-Mobile", "?0")
+	req.Header.Set("Sec-Ch-Ua-Platform", `"Windows"`)
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
@@ -377,6 +384,12 @@ func doPOST(client *http.Client, rawURL, body string, headers map[string]string)
 	if err != nil {
 		return nil, err
 	}
+	req.Header.Set("User-Agent", ua)
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("Sec-Ch-Ua", `"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"`)
+	req.Header.Set("Sec-Ch-Ua-Mobile", "?0")
+	req.Header.Set("Sec-Ch-Ua-Platform", `"Windows"`)
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}

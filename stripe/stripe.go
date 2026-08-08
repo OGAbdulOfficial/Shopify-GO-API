@@ -32,7 +32,7 @@ type StripeRequest struct {
 
 // DefaultStripeSites is the pool of fast, long-term Stripe sites used when no custom site is provided
 var DefaultStripeSites = []string{
-	"https://belovedcommunity.org/donate/",
+	"https://www.charitywater.org/donate",
 }
 
 // StripeResult is the structured response returned for every check (matching Shopify API format)

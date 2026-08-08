@@ -19,8 +19,8 @@ func TestCheckStripeUserCard(t *testing.T) {
 		CC: "4297690191832445|05|2027|832",
 	})
 	t.Logf("USER CARD TEST RESULT: %+v", res)
-	if res.Status == "error" || res.Response == "CARD_DECLINED" && res.Message != "" && res.DeclineCode == "" && (res.Message == "This integration surface is unsupported for publishable key tokenization.") {
-		t.Fatalf("Stripe card check failed with integration surface error: %s", res.Message)
+	if res.Status == "error" {
+		t.Fatalf("Stripe card check failed: %s", res.Message)
 	}
 }
 

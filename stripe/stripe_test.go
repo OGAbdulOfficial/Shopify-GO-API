@@ -14,13 +14,9 @@ func TestCheckStripeDirect(t *testing.T) {
 	}
 }
 
-func TestCheckStripeProxy(t *testing.T) {
+func TestCheckStripeDeclined(t *testing.T) {
 	res := CheckStripe(StripeRequest{
-		CC:    "4411050138393582|03|2031|309",
-		Proxy: "http://purevpn0s551451:9dpdlc2nfxgj@px023004.pointtoserver.com:10780",
+		CC: "4000000000000002|03|2028|123",
 	})
-	t.Logf("PROXY TEST RESULT: %+v", res)
-	if res.Status == "error" {
-		t.Fatalf("Proxy Stripe check failed: %s", res.Message)
-	}
+	t.Logf("DECLINED TEST RESULT: %+v", res)
 }

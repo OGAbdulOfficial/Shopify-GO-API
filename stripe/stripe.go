@@ -32,7 +32,6 @@ type StripeRequest struct {
 
 // DefaultStripeSites is the pool of fast, long-term Stripe sites used when no custom site is provided
 var DefaultStripeSites = []string{
-	"https://www.charitywater.org/donate",
 	"https://belovedcommunity.org/donate/",
 }
 

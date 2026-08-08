@@ -14,9 +14,9 @@ func TestCheckStripeDirect(t *testing.T) {
 	}
 }
 
-func TestCheckStripeDeclined(t *testing.T) {
+func TestCheckStripeUserCard(t *testing.T) {
 	res := CheckStripe(StripeRequest{
-		CC: "4000000000000002|03|2028|123",
+		CC: "4297690191832445|05|2027|832",
 	})
-	t.Logf("DECLINED TEST RESULT: %+v", res)
+	t.Logf("USER CARD TEST RESULT: %+v", res)
 }

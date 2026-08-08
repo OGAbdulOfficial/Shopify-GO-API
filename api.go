@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"gocheck/stripe"
 )
 
 // serverSem limits concurrent checkout flows to prevent resource exhaustion.
@@ -299,6 +301,8 @@ func runAPIServer() {
 	mux.HandleFunc("/api/check", handleCheckSingle)
 	mux.HandleFunc("/api/check/batch", handleCheckBatch)
 	mux.HandleFunc("/sites/working", handleGetWorkingSites)
+	mux.HandleFunc("/stripe/check", stripe.HandleStripeCheck)
+	mux.HandleFunc("/stripe/batch", stripe.HandleStripeBatch)
 
 	// Apply middleware
 	handler := corsMiddleware(loggingMiddleware(mux))

@@ -272,7 +272,7 @@ func CheckStripe(req StripeRequest) StripeResult {
 
 	secretMatch := regexp.MustCompile(`pi_[a-zA-Z0-9]+_secret_[a-zA-Z0-9]+`).FindString(string(formBody))
 	if secretMatch == "" {
-		return errResult(req, "error", "Payment intent secret not found in form response", "", start)
+		return errResult(req, "error", "Payment intent secret not found in form response: "+string(formBody[:min(300, len(formBody))]), "", start)
 	}
 	intentID := strings.Split(secretMatch, "_secret_")[0]
 

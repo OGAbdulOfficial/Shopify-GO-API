@@ -2,6 +2,7 @@ package stripe
 
 import (
 	"crypto/md5"
+	"crypto/rand"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -242,10 +243,12 @@ func CheckStripe(req StripeRequest) StripeResult {
 	formData.Set("platform_info[connectionRtt]", "100")
 
 	// Set cookies for stripe mid/sid and happyforms checkout
+	stripeMID := generateUUID()
+	stripeSID := generateUUID()
 	pmCookie := fmt.Sprintf(`{"payment_method":"%s"}`, pmID)
 	cookieHeader := fmt.Sprintf(
-		"__stripe_mid=stripe-mid-test; __stripe_sid=stripe-sid-test; happyforms_%s_stripe_checkout=%s",
-		formID, url.QueryEscape(pmCookie),
+		"__stripe_mid=%s; __stripe_sid=%s; happyforms_%s_stripe_checkout=%s",
+		stripeMID, stripeSID, formID, pmCookie,
 	)
 
 	formHeaders := map[string]string{
@@ -380,4 +383,12 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func generateUUID() string {
+	b := make([]byte, 16)
+	rand.Read(b)
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
 }

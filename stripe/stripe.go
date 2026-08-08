@@ -144,13 +144,15 @@ func CheckStripe(req StripeRequest) StripeResult {
 	}
 	html := string(pageResp)
 
-	pkMatch := regexp.MustCompile(`"key":"(pk_live_[^"]+)"`).FindStringSubmatch(html)
-	if pkMatch == nil {
+	pkLive := regexp.MustCompile(`pk_live_[a-zA-Z0-9]+`).FindString(html)
+	if pkLive == "" {
 		return errResult(req, "error", "pk_live not found on gate page", "", start)
 	}
-	pkLive := pkMatch[1]
 
-	seedMatch := regexp.MustCompile(`name="happyforms_random_seed" value="(\d+)"`).FindStringSubmatch(html)
+	seedMatch := regexp.MustCompile(`name=["']happyforms_random_seed["']\s+value=["'](\d+)["']`).FindStringSubmatch(html)
+	if seedMatch == nil {
+		seedMatch = regexp.MustCompile(`happyforms_random_seed[^>]*value=["'](\d+)["']`).FindStringSubmatch(html)
+	}
 	if seedMatch == nil {
 		return errResult(req, "error", "random_seed not found on gate page", "", start)
 	}

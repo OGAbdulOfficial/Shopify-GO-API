@@ -445,6 +445,29 @@ func CheckStripe(req StripeRequest) StripeResult {
 	var pmMap map[string]any
 	json.Unmarshal(pmBody, &pmMap)
 
+	// If proxy caused "integration surface is unsupported" restriction on Stripe API, retry PM creation directly
+	if errMap, ok2 := pmMap["error"].(map[string]any); ok2 {
+		msg, _ := errMap["message"].(string)
+		if strings.Contains(msg, "integration surface is unsupported") && req.Proxy != "" {
+			directClient := buildClient("", 25*time.Second)
+			directReq, _ := http.NewRequest("POST", "https://api.stripe.com/v1/payment_methods", strings.NewReader(pmPayload.Encode()))
+			for k, v := range pmHeaders {
+				directReq.Header.Set(k, v)
+			}
+			directReq.SetBasicAuth(pkLive, "")
+			if directHTTP, dErr := directClient.Do(directReq); dErr == nil {
+				if dBody, dReadErr := io.ReadAll(directHTTP.Body); dReadErr == nil {
+					var dMap map[string]any
+					if json.Unmarshal(dBody, &dMap) == nil {
+						pmMap = dMap
+						proxyUsed = false
+					}
+				}
+				directHTTP.Body.Close()
+			}
+		}
+	}
+
 	// Handle Stripe PM errors (invalid card, expired, CVC fail, etc.)
 	if errMap, ok2 := pmMap["error"].(map[string]any); ok2 {
 		code, _ := errMap["code"].(string)

